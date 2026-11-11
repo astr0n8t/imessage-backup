@@ -6,4 +6,5 @@ pub mod index;
 pub mod media;
 pub mod queries;
 pub mod render;
+pub mod view;
 pub mod web;

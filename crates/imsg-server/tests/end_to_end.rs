@@ -1,7 +1,7 @@
 //! Extract two synthetic backups, ingest them and exercise the HTTP API.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -11,10 +11,11 @@ use chrono::{TimeZone, Utc};
 use http_body_util::BodyExt;
 use imsg_core::backup::attachment_file_id;
 use imsg_core::fixture::{build_sample_backup, guid};
-use imsg_server::auth::{Throttle, Users, hash_password};
+use imsg_server::auth::{Accounts, hash_password};
 use imsg_server::index::Index;
 use imsg_server::media::Tools;
 use imsg_server::queries::{self, Cursor, Names};
+use imsg_server::view::View;
 use imsg_server::web::{AppState, router};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -56,13 +57,15 @@ async fn ingest_and_serve() {
     let r = index.ingest_all(&data).unwrap();
     assert_eq!(r.snapshots, 1);
     let conn = index.read().unwrap();
-    let names = Names::load(&conn).unwrap();
-    let convs = queries::conversations(&conn, &names).unwrap();
+    let view = View::everything();
+    view.install(&conn).unwrap();
+    let names = Names::load(&conn, &view).unwrap();
+    let convs = queries::conversations(&conn, &view, &names).unwrap();
     let titles: Vec<&str> = convs.iter().map(|c| c.title.as_str()).collect();
     assert_eq!(titles, ["Road Trip", "Jane Appleseed"]);
     let jane = convs.iter().find(|c| c.title == "Jane Appleseed").unwrap();
     assert!(!jane.is_group);
-    let page = queries::messages(&conn, &names, jane.id, Cursor::Latest, 50).unwrap();
+    let page = queries::messages(&conn, &view, &names, jane.id, Cursor::Latest, 50).unwrap();
     let v = body_json(&page);
     let msgs = v["messages"].as_array().unwrap();
     assert_eq!(
@@ -99,8 +102,10 @@ async fn ingest_and_serve() {
     assert_eq!(r.snapshots, 1);
     assert_eq!(r.messages, 3);
     let conn = index.read().unwrap();
-    let names = Names::load(&conn).unwrap();
-    let page = queries::messages(&conn, &names, jane.id, Cursor::Latest, 50).unwrap();
+    let view = View::everything();
+    view.install(&conn).unwrap();
+    let names = Names::load(&conn, &view).unwrap();
+    let page = queries::messages(&conn, &view, &names, jane.id, Cursor::Latest, 50).unwrap();
     let v = body_json(&page);
     let msgs = v["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 5);
@@ -123,7 +128,7 @@ async fn ingest_and_serve() {
         .unwrap();
     assert_eq!(reply["reply_to"]["name"], "Jane Appleseed");
     assert_eq!(msgs[0]["reply_count"], 1);
-    let convs = queries::conversations(&conn, &names).unwrap();
+    let convs = queries::conversations(&conn, &view, &names).unwrap();
     assert_eq!(
         convs[0].title, "Jane Appleseed",
         "most recent conversation first"
@@ -135,20 +140,28 @@ async fn ingest_and_serve() {
         "contacts refreshed"
     );
 
-    let hits = queries::search(&conn, &names, "dinn", None, 10).unwrap();
+    let hits = queries::search(&conn, &view, &names, "dinn", None, 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].snippet.contains("\u{2}dinner\u{3}"));
     assert!(
-        queries::search(&conn, &names, "\"); DROP TABLE messages; --", None, 10)
-            .unwrap()
-            .is_empty()
+        queries::search(
+            &conn,
+            &view,
+            &names,
+            "\"); DROP TABLE messages; --",
+            None,
+            10
+        )
+        .unwrap()
+        .is_empty()
     );
 
     // Paging.
-    let first = queries::messages(&conn, &names, jane.id, Cursor::Latest, 2).unwrap();
+    let first = queries::messages(&conn, &view, &names, jane.id, Cursor::Latest, 2).unwrap();
     assert!(first.has_more_before);
     let older = queries::messages(
         &conn,
+        &view,
         &names,
         jane.id,
         Cursor::Before(first.messages[0].id),
@@ -160,26 +173,21 @@ async fn ingest_and_serve() {
     drop(conn);
 
     // ---- HTTP ----
-    let users = Users::parse(&format!(
+    let accounts = Accounts::parse(&format!(
         "alice:{}",
         hash_password("correct-horse").unwrap()
     ))
     .unwrap();
-    let names = Names::load(&index.read().unwrap()).unwrap();
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         index,
-        data: data.clone(),
-        cache: tmp.path().join("state/cache"),
-        users,
-        throttle: Throttle::default(),
-        names: RwLock::new(Arc::new(names)),
-        tools: Tools::default(),
-        secure_cookies: false,
-        trust_forwarded_for: false,
-        session_ttl: Duration::from_secs(3600),
-        ingest_lock: tokio::sync::Mutex::new(()),
-        last_ingest: RwLock::new(None),
-    });
+        data.clone(),
+        tmp.path().join("state/cache"),
+        accounts,
+        Tools::default(),
+        false,
+        false,
+        Duration::from_secs(3600),
+    ));
     let app = router(state).layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4000))));
     let send = |req: Request<Body>| {
         let app = app.clone();

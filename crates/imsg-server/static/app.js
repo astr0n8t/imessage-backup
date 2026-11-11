@@ -4,6 +4,8 @@
 
 const $ = (sel) => document.querySelector(sel);
 const state = {
+  me: null,
+  viewAs: null, // admins: another account's name, or null for their own
   conversations: [],
   current: null,
   oldestId: null,
@@ -32,8 +34,14 @@ function el(tag, attrs = {}, ...children) {
   return e;
 }
 
+// Admins looking at another account pass ?as=<name> on every data request.
+function withView(url) {
+  if (!state.viewAs) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}as=${encodeURIComponent(state.viewAs)}`;
+}
+
 async function api(path, opts) {
-  const r = await fetch(path, { credentials: "same-origin", ...opts });
+  const r = await fetch(path === "/api/me" ? path : withView(path), { credentials: "same-origin", ...opts });
   if (r.status === 401) {
     location.href = "/login";
     throw new Error("signed out");
@@ -172,10 +180,10 @@ function attachmentNode(p) {
   const name = p.name || "attachment";
   const missing = () => el("span", { class: "file missing", text: `📎 ${name} (not in archive)` });
   if (!p.file) return missing();
-  const src = `/media/${p.file}`;
+  const src = withView(`/media/${p.file}`);
   if (mime.startsWith("image/") || /\.(heic|jpe?g|png|gif|webp)$/i.test(name)) {
     const img = el("img", { src, alt: name, loading: "lazy", onclick: () => window.open(src, "_blank", "noopener") });
-    img.addEventListener("error", () => img.parentNode && img.parentNode.replaceWith(el("a", { class: "file", href: `${src}?dl=1`, text: `🖼 ${name} ${size(p.size)}` })));
+    img.addEventListener("error", () => img.parentNode && img.parentNode.replaceWith(el("a", { class: "file", href: `${src}${src.includes("?") ? "&" : "?"}dl=1`, text: `🖼 ${name} ${size(p.size)}` })));
     return el("div", { class: "media" + (p.sticker ? " sticker" : "") }, img);
   }
   if (mime.startsWith("video/")) {
@@ -185,7 +193,7 @@ function attachmentNode(p) {
     return el("div", { class: "media" }, el("audio", { src, controls: true, preload: "none" }),
       p.transcription ? el("div", { class: "meta", text: `“${p.transcription}”` }) : null);
   }
-  return el("a", { class: "file", href: `${src}?dl=1`, text: `📎 ${name} ${size(p.size)}` });
+  return el("a", { class: "file", href: `${src}${src.includes("?") ? "&" : "?"}dl=1`, text: `📎 ${name} ${size(p.size)}` });
 }
 
 function appNode(p) {
@@ -379,13 +387,26 @@ async function showStatus() {
   const s = await api("/api/status");
   const body = $("#status-body");
   const rows = s.snapshots.map((x) => el("tr", {},
-    el("td", { text: x.device }), el("td", { text: x.snapshot_id }),
+    el("td", { text: x.device_name ? `${x.device_name} (${x.device})` : x.device }), el("td", { text: x.snapshot_id }),
     el("td", { text: x.backup_ms ? fullFmt.format(x.backup_ms) : "" }), el("td", { text: x.messages.toLocaleString() })));
+  const who = state.me ? `Signed in as ${state.me.name}${state.viewAs ? ` · viewing ${state.viewAs}` : ""}` : "";
+  let identities = null;
+  if (state.me && state.me.admin) {
+    const ids = await api("/api/identities");
+    identities = [el("h3", { text: "Devices & iMessage IDs (for the accounts file)" }),
+      el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device UDID" }), el("th", { text: "Name" }), el("th", { text: "iMessage IDs used" }))),
+        el("tbody", {}, ids.map((d) => el("tr", {},
+          el("td", {}, el("code", { text: d.device })), el("td", { text: d.device_name || "" }),
+          el("td", { text: d.imessage_ids.map(([id, n]) => `${id || "(unknown)"} (${n})`).join(", ") })))))];
+  }
   body.replaceChildren(
+    el("p", { text: who }),
     el("p", { text: `${s.messages.toLocaleString()} messages in ${s.conversations.toLocaleString()} conversations · ${s.contacts.toLocaleString()} contact handles` }),
     el("p", { text: `Transcoding: ${s.transcoding}` }),
     s.last_scan ? el("p", { text: `Last scan ${fullFmt.format(new Date(s.last_scan.at))}: ${s.last_scan.report.snapshots} new snapshot(s), ${s.last_scan.report.waiting} waiting for files, ${s.last_scan.report.failed} failed` }) : null,
-    el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device" }), el("th", { text: "Snapshot" }), el("th", { text: "Backup" }), el("th", { text: "Messages" }))), el("tbody", {}, rows)));
+    el("h3", { text: "Snapshots" }),
+    el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device" }), el("th", { text: "Snapshot" }), el("th", { text: "Backup" }), el("th", { text: "Messages" }))), el("tbody", {}, rows)),
+    ...(identities || []));
   const d = $("#status-dialog");
   if (!d.open) d.showModal();
 }
@@ -423,4 +444,24 @@ $("#messages").addEventListener("scroll", () => {
   if (box.scrollHeight - box.scrollTop - box.clientHeight < 400) loadNewer();
 });
 window.addEventListener("hashchange", route);
-loadConversations().then(route).catch((e) => console.error(e));
+async function loadMe() {
+  state.me = await api("/api/me");
+  if (!state.me.admin) return;
+  let saved = null;
+  try { saved = localStorage.getItem("imsg.viewAs"); } catch {}
+  const names = state.me.accounts.map((a) => a.name);
+  state.viewAs = saved && saved !== state.me.name && names.includes(saved) ? saved : null;
+  const sel = $("#view-select");
+  sel.replaceChildren(...names.map((n) => el("option", { value: n, text: n === state.me.name ? `${n} (you)` : n })));
+  sel.value = state.viewAs || state.me.name;
+  $("#view-wrap").hidden = names.length < 2;
+  sel.addEventListener("change", async () => {
+    state.viewAs = sel.value === state.me.name ? null : sel.value;
+    try { localStorage.setItem("imsg.viewAs", sel.value); } catch {}
+    state.names = {};
+    if (location.hash) location.hash = ""; else route();
+    await loadConversations();
+  });
+}
+
+loadMe().then(loadConversations).then(route).catch((e) => console.error(e));
