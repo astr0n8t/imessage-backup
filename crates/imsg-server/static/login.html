@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Messages Archive · Sign in</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-body">
+<main class="login-card">
+  <h1>Messages Archive</h1>
+  <p class="login-error" role="alert">{{error}}</p>
+  <form method="post" action="/login">
+    <label>Username<input name="username" autocomplete="username" autocapitalize="none" required autofocus></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit">Sign in</button>
+  </form>
+</main>
+</body>
+</html>

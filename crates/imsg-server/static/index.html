@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Messages Archive</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header class="side-head">
+      <h1>Messages</h1>
+      <div class="side-actions">
+        <button id="status-btn" class="icon-btn" title="Archive status" aria-label="Archive status">ⓘ</button>
+        <form method="post" action="/logout"><button class="text-btn">Sign out</button></form>
+      </div>
+    </header>
+    <div class="search-wrap">
+      <input id="search" type="search" placeholder="Search conversations and messages" autocomplete="off">
+    </div>
+    <nav id="conv-list" aria-label="Conversations"></nav>
+    <section id="search-results" hidden aria-label="Search results"></section>
+  </aside>
+  <main id="thread" aria-live="polite">
+    <header id="thread-head" hidden>
+      <button id="back-btn" class="icon-btn" aria-label="Back">‹</button>
+      <div class="thread-title">
+        <h2 id="thread-name"></h2>
+        <div id="thread-sub"></div>
+      </div>
+    </header>
+    <div id="messages"><div class="empty">Select a conversation</div></div>
+  </main>
+</div>
+<dialog id="status-dialog">
+  <form method="dialog" class="dialog-head"><h2>Archive status</h2><button class="icon-btn" aria-label="Close">✕</button></form>
+  <div id="status-body"></div>
+  <button id="rescan-btn">Scan for new snapshots</button>
+</dialog>
+<script src="/static/app.js"></script>
+</body>
+</html>
