@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
             let state_dir = paths.state_dir();
             let index = Index::open(&state_dir.join("index.sqlite")).context("opening index")?;
             let tools = Tools::detect();
-            info!(accounts = accounts.len(), transcoding = %tools.describe(), "starting");
+            info!(accounts = accounts.len(), transcoding = %tools.describe(), assets = imsg_server::web::asset_version(), "starting");
             let state = Arc::new(AppState::new(
                 index,
                 paths.data.clone(),

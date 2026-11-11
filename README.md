@@ -221,7 +221,30 @@ ImageMagick; `sips` is used automatically on macOS) and `ffmpeg` for the same be
 
 Messages deleted from the phone stay in the archive, because older snapshots are never rewritten.
 
-## Automating the Mac side
+### On your phone: install it as an app
+
+The web UI is built for phones as well as desktops. It works one-handed, has large touch targets, respects the
+notch and home indicator, and opens photos full-screen (the back gesture closes them). Tap any message to see
+when it was sent, delivered and read, its edit history, and who reacted.
+
+It is also a Progressive Web App, so you can install it to the home screen and open it like a native app,
+without browser chrome:
+
+* **iPhone / iPad:** open the site in Safari → Share → **Add to Home Screen**.
+* **Android / Chrome / Edge:** use the **Install** button in the sidebar, or the browser menu's *Install app*.
+
+Notes:
+
+* Installing needs HTTPS (or `localhost`). Behind a TLS reverse proxy it just works. Use `--secure-cookies` there.
+* On iOS, the installed app has its own cookies, so you sign in once more inside it (including the two-factor
+  code). Sessions last `--session-days` (30 by default).
+* The service worker caches only the app's code, styles and icons, for fast start-up and an "offline" screen.
+  **Messages and attachments are never stored on the device by the app.** They always come from the server, and
+  API responses are marked `no-store`.
+* Updates roll out automatically: asset URLs carry a content hash, and a new server build replaces the cached
+  shell on the next launch.
+
+
 
 Finder can't be scripted to make backups. Once a backup exists, extraction is a single command, which you can
 run from `launchd` or cron, e.g.:
