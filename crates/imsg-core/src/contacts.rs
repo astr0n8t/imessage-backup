@@ -47,7 +47,8 @@ pub fn load_contacts(path: &Path) -> Result<Vec<Contact>> {
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut people: HashMap<i64, Contact> = HashMap::new();
     {
-        let mut stmt = db.prepare("SELECT ROWID, First, Last, Nickname, Organization FROM ABPerson")?;
+        let mut stmt =
+            db.prepare("SELECT ROWID, First, Last, Nickname, Organization FROM ABPerson")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -65,9 +66,14 @@ pub fn load_contacts(path: &Path) -> Result<Vec<Contact>> {
             people.insert(id, c);
         }
     }
-    let mut stmt = db.prepare("SELECT record_id, property, value FROM ABMultiValue WHERE value IS NOT NULL")?;
+    let mut stmt =
+        db.prepare("SELECT record_id, property, value FROM ABMultiValue WHERE value IS NOT NULL")?;
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+        ))
     })?;
     for row in rows {
         let (id, prop, value) = row?;
@@ -112,7 +118,9 @@ pub fn handle_key(handle: &str) -> Option<String> {
 pub fn name_index(contacts: &[Contact]) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for c in contacts {
-        let Some(name) = c.display_name() else { continue };
+        let Some(name) = c.display_name() else {
+            continue;
+        };
         for h in c.phones.iter().chain(c.emails.iter()) {
             if let Some(k) = handle_key(h) {
                 map.entry(k).or_insert_with(|| name.clone());
@@ -132,10 +140,17 @@ pub fn write_test_address_book(path: &Path, people: &[(&str, &str, &[&str])]) ->
             identifier INTEGER, label INTEGER, value TEXT);",
     )?;
     for (first, last, handles) in people {
-        db.execute("INSERT INTO ABPerson (First, Last) VALUES (?1, ?2)", [first, last])?;
+        db.execute(
+            "INSERT INTO ABPerson (First, Last) VALUES (?1, ?2)",
+            [first, last],
+        )?;
         let id = db.last_insert_rowid();
         for h in *handles {
-            let prop = if h.contains('@') { PROP_EMAIL } else { PROP_PHONE };
+            let prop = if h.contains('@') {
+                PROP_EMAIL
+            } else {
+                PROP_PHONE
+            };
             db.execute(
                 "INSERT INTO ABMultiValue (record_id, property, value) VALUES (?1, ?2, ?3)",
                 rusqlite::params![id, prop, h],
@@ -161,10 +176,17 @@ mod tests {
     fn load_and_index() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("ab.sqlitedb");
-        write_test_address_book(&p, &[("Jane", "Doe", &["(555) 010-0000", "jane@example.com"])]).unwrap();
+        write_test_address_book(
+            &p,
+            &[("Jane", "Doe", &["(555) 010-0000", "jane@example.com"])],
+        )
+        .unwrap();
         let contacts = load_contacts(&p).unwrap();
         let idx = name_index(&contacts);
-        assert_eq!(idx.get(&handle_key("+15550100000").unwrap()).unwrap(), "Jane Doe");
+        assert_eq!(
+            idx.get(&handle_key("+15550100000").unwrap()).unwrap(),
+            "Jane Doe"
+        );
         assert_eq!(idx.get("jane@example.com").unwrap(), "Jane Doe");
     }
 }

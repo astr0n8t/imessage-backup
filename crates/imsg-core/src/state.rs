@@ -68,13 +68,19 @@ pub struct SnapshotSummary {
 impl State {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(State { version: STATE_VERSION, ..Default::default() });
+            return Ok(State {
+                version: STATE_VERSION,
+                ..Default::default()
+            });
         }
         let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let state: State =
             serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
         if state.version > STATE_VERSION {
-            bail!("{} was written by a newer version of imsg-extract", path.display());
+            bail!(
+                "{} was written by a newer version of imsg-extract",
+                path.display()
+            );
         }
         Ok(state)
     }

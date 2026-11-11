@@ -738,8 +738,10 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "http-body-util",
  "imessage-database",
  "imsg-core",
+ "imsg-extract",
  "rand",
  "rpassword",
  "rusqlite",
@@ -749,6 +751,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

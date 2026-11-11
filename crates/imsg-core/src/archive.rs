@@ -13,9 +13,10 @@
 //!
 //! Every snapshot's `sms.db` keeps the original iOS schema, containing only the
 //! messages that are new (or edited) since the previous snapshot plus all chat
-//! and handle rows. Because attachments use the backup's hashed layout, a device
-//! folder can be read by imessage-database (and imessage-exporter with
-//! `--platform iOS`) after pointing it at a snapshot's database.
+//! and handle rows, so any tool that reads `sms.db` (imessage-database,
+//! sqlite3, ...) can open it. Attachments keep the backup's hashed naming
+//! (`SHA-1("MediaDomain-" + path)`), the same scheme imessage-database uses to
+//! resolve attachments of iOS backups.
 //!
 //! The folders are designed to be merged with a plain copy (`rsync`, Finder,
 //! etc.): nothing is ever rewritten, only added.
@@ -194,18 +195,28 @@ pub fn discover_snapshots(archive: &Path) -> Result<Vec<SnapshotRef>> {
         }
         for snap in fs::read_dir(&snaps)? {
             let dir = snap?.path();
-            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if name.starts_with('.') || !dir.is_dir() {
                 continue;
             }
             if let Ok(meta) = SnapshotMeta::read(&dir) {
-                out.push(SnapshotRef { device_dir: dev.clone(), dir, meta });
+                out.push(SnapshotRef {
+                    device_dir: dev.clone(),
+                    dir,
+                    meta,
+                });
             }
         }
     }
     out.sort_by(|a, b| {
-        (a.meta.backup_date, &a.meta.snapshot_id, &a.meta.device_udid)
-            .cmp(&(b.meta.backup_date, &b.meta.snapshot_id, &b.meta.device_udid))
+        (a.meta.backup_date, &a.meta.snapshot_id, &a.meta.device_udid).cmp(&(
+            b.meta.backup_date,
+            &b.meta.snapshot_id,
+            &b.meta.device_udid,
+        ))
     });
     Ok(out)
 }

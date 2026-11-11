@@ -66,7 +66,9 @@ fn describe(info: &BackupInfo) -> String {
         info.device_name.as_deref().unwrap_or("?"),
         info.product_version.as_deref().unwrap_or("?"),
         if info.encrypted { "encrypted" } else { "plain" },
-        info.last_backup_date.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        info.last_backup_date
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_default(),
     )
 }
 
@@ -101,7 +103,9 @@ fn main() -> Result<()> {
                     let root = backup_root.unwrap_or_else(default_backup_root);
                     let all = list_backups(&root)?;
                     let chosen = match &udid {
-                        Some(u) => all.into_iter().find(|(_, i)| i.udid.eq_ignore_ascii_case(u)),
+                        Some(u) => all
+                            .into_iter()
+                            .find(|(_, i)| i.udid.eq_ignore_ascii_case(u)),
                         None => all.into_iter().next(),
                     };
                     match chosen {

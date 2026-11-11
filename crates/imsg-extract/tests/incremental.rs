@@ -1,15 +1,20 @@
 use chrono::{Duration, TimeZone, Utc};
 use imsg_core::archive::{self, SnapshotKind};
 use imsg_core::backup::attachment_file_id;
-use imsg_core::fixture::build_sample_backup;
+use imsg_core::fixture::{build_sample_backup, guid};
 use imsg_core::state::State;
 use imsg_extract::{Options, run};
 use rusqlite::Connection;
 
 fn guids(db: &std::path::Path) -> Vec<String> {
     let c = Connection::open(db).unwrap();
-    let mut s = c.prepare("SELECT guid FROM message ORDER BY ROWID").unwrap();
-    s.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    let mut s = c
+        .prepare("SELECT guid FROM message ORDER BY ROWID")
+        .unwrap();
+    s.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
 }
 
 fn scenario(password: Option<&str>) {
@@ -39,7 +44,10 @@ fn scenario(password: Option<&str>) {
     assert_eq!(s1.message_count, 6);
     assert!(s1.has_file(archive::CONTACTS_FILE));
     let dir1 = r1.snapshot_dir.unwrap();
-    assert_eq!(guids(&dir1.join("sms.db")), ["GUID-M1", "GUID-M2", "GUID-M3", "GUID-M4", "GUID-M5", "GUID-M5B"]);
+    assert_eq!(
+        guids(&dir1.join("sms.db")),
+        ["M1", "M2", "M3", "M4", "M5", "M5B"].map(guid)
+    );
     assert!(s1.verify(&dir1, true).unwrap());
     let dev_dir = archive::device_dir(&out, "00008110-AAAA");
     let photo = archive::attachment_path(
@@ -62,13 +70,17 @@ fn scenario(password: Option<&str>) {
     assert_eq!(s2.kind, SnapshotKind::Incremental);
     assert_eq!(s2.after_rowid, 6);
     let dir2 = r2.snapshot_dir.unwrap();
-    assert_eq!(guids(&dir2.join("sms.db")), ["GUID-M2", "GUID-M6", "GUID-M7"]);
+    assert_eq!(guids(&dir2.join("sms.db")), ["M2", "M6", "M7"].map(guid));
     assert!(r2.contacts_updated);
     // Chats and handles are always complete.
     let c = Connection::open(dir2.join("sms.db")).unwrap();
-    let chats: i64 = c.query_row("SELECT count(*) FROM chat", [], |r| r.get(0)).unwrap();
+    let chats: i64 = c
+        .query_row("SELECT count(*) FROM chat", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(chats, 2);
-    let atts: i64 = c.query_row("SELECT count(*) FROM attachment", [], |r| r.get(0)).unwrap();
+    let atts: i64 = c
+        .query_row("SELECT count(*) FROM attachment", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(atts, 0);
 
     // Unchanged backup is skipped.

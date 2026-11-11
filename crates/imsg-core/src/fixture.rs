@@ -56,6 +56,11 @@ CREATE TRIGGER after_delete_on_message AFTER DELETE ON message BEGIN
     SELECT read_receipts_changed(); END;
 "#;
 
+/// A UUID-shaped message GUID (iOS GUIDs are 36 characters and parsers rely on that).
+pub fn guid(label: &str) -> String {
+    format!("00000000-0000-4000-8000-{label:0>12}")
+}
+
 /// Apple epoch (2001-01-01) nanoseconds from a unix timestamp in seconds.
 pub fn apple_ns(unix_secs: i64) -> i64 {
     (unix_secs - 978_307_200) * 1_000_000_000
@@ -73,7 +78,9 @@ impl SmsFixture {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self { conn: Connection::open(path)? })
+        Ok(Self {
+            conn: Connection::open(path)?,
+        })
     }
 
     pub fn handle(&self, id: &str, service: &str) -> Result<i64> {
@@ -84,7 +91,13 @@ impl SmsFixture {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn chat(&self, identifier: &str, service: &str, name: Option<&str>, handles: &[i64]) -> Result<i64> {
+    pub fn chat(
+        &self,
+        identifier: &str,
+        service: &str,
+        name: Option<&str>,
+        handles: &[i64],
+    ) -> Result<i64> {
         let style = if handles.len() > 1 { 43 } else { 45 };
         self.conn.execute(
             "INSERT INTO chat (guid, style, chat_identifier, service_name, display_name) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -92,13 +105,24 @@ impl SmsFixture {
         )?;
         let chat = self.conn.last_insert_rowid();
         for h in handles {
-            self.conn.execute("INSERT INTO chat_handle_join VALUES (?1, ?2)", params![chat, h])?;
+            self.conn.execute(
+                "INSERT INTO chat_handle_join VALUES (?1, ?2)",
+                params![chat, h],
+            )?;
         }
         Ok(chat)
     }
 
     /// Insert a plain-text message (no `attributedBody`; the parser falls back to `text`).
-    pub fn message(&self, chat: i64, guid: &str, handle: i64, from_me: bool, unix: i64, text: &str) -> Result<i64> {
+    pub fn message(
+        &self,
+        chat: i64,
+        guid: &str,
+        handle: i64,
+        from_me: bool,
+        unix: i64,
+        text: &str,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO message (guid, text, handle_id, service, date, date_read, date_delivered, is_from_me, is_read)
              VALUES (?1, ?2, ?3, 'iMessage', ?4, 0, 0, ?5, 1)",
@@ -112,7 +136,15 @@ impl SmsFixture {
         Ok(id)
     }
 
-    pub fn tapback(&self, chat: i64, guid: &str, handle: i64, unix: i64, target: &str, kind: i32) -> Result<i64> {
+    pub fn tapback(
+        &self,
+        chat: i64,
+        guid: &str,
+        handle: i64,
+        unix: i64,
+        target: &str,
+        kind: i32,
+    ) -> Result<i64> {
         let id = self.message(chat, guid, handle, false, unix, "")?;
         self.conn.execute(
             "UPDATE message SET text = NULL, associated_message_guid = ?1, associated_message_type = ?2 WHERE ROWID = ?3",
@@ -121,14 +153,24 @@ impl SmsFixture {
         Ok(id)
     }
 
-    pub fn attachment(&self, message: i64, guid: &str, filename: &str, mime: &str, bytes: i64) -> Result<i64> {
+    pub fn attachment(
+        &self,
+        message: i64,
+        guid: &str,
+        filename: &str,
+        mime: &str,
+        bytes: i64,
+    ) -> Result<i64> {
         let transfer = filename.rsplit('/').next().unwrap_or(filename);
         self.conn.execute(
             "INSERT INTO attachment (guid, filename, mime_type, transfer_name, total_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![guid, filename, mime, transfer, bytes],
         )?;
         let id = self.conn.last_insert_rowid();
-        self.conn.execute("INSERT INTO message_attachment_join VALUES (?1, ?2)", params![message, id])?;
+        self.conn.execute(
+            "INSERT INTO message_attachment_join VALUES (?1, ?2)",
+            params![message, id],
+        )?;
         self.conn.execute(
             "UPDATE message SET cache_has_attachments = 1, text = coalesce(text, '') || char(65532) WHERE ROWID = ?1",
             [message],
@@ -162,32 +204,53 @@ pub fn build_sample_backup(
     let dm = f.chat("+15550100000", "iMessage", None, &[jane])?;
     let group = f.chat("chat123456789", "iMessage", Some("Road Trip"), &[jane, bob])?;
     let t = SAMPLE_T0;
-    f.message(dm, "GUID-M1", jane, false, t, "Hey there! Are we still on for Friday?")?;
-    f.message(dm, "GUID-M2", jane, true, t + 60, "Yes! See you at 7")?;
-    let photo = f.message(dm, "GUID-M3", jane, false, t + 120, "")?;
+    f.message(
+        dm,
+        &guid("M1"),
+        jane,
+        false,
+        t,
+        "Hey there! Are we still on for Friday?",
+    )?;
+    f.message(dm, &guid("M2"), jane, true, t + 60, "Yes! See you at 7")?;
+    let photo = f.message(dm, &guid("M3"), jane, false, t + 120, "")?;
     let photo_path = "~/Library/SMS/Attachments/0a/10/AT-GUID-1/IMG_0001.JPG";
     f.attachment(photo, "AT-GUID-1", photo_path, "image/jpeg", 4)?;
-    f.tapback(dm, "GUID-M4", jane, t + 180, "GUID-M2", 2000)?;
-    f.message(group, "GUID-M5", bob, false, t + 240, "Who's driving?")?;
+    f.tapback(dm, &guid("M4"), jane, t + 180, &guid("M2"), 2000)?;
+    f.message(group, &guid("M5"), bob, false, t + 240, "Who's driving?")?;
     // An attachment that was offloaded to iCloud and is not in the backup.
-    let missing = f.message(group, "GUID-M5B", bob, false, t + 250, "")?;
-    f.attachment(missing, "AT-GUID-2", "~/Library/SMS/Attachments/0b/11/AT-GUID-2/map.png", "image/png", 10)?;
+    let missing = f.message(group, &guid("M5B"), bob, false, t + 250, "")?;
+    f.attachment(
+        missing,
+        "AT-GUID-2",
+        "~/Library/SMS/Attachments/0b/11/AT-GUID-2/map.png",
+        "image/png",
+        10,
+    )?;
     if stage >= 2 {
-        f.message(dm, "GUID-M6", jane, false, t + 86_400, "Thanks for dinner 🍝")?;
-        let reply = f.message(dm, "GUID-M7", jane, true, t + 86_460, "Anytime!")?;
+        f.message(
+            dm,
+            &guid("M6"),
+            jane,
+            false,
+            t + 86_400,
+            "Thanks for dinner 🍝",
+        )?;
+        let reply = f.message(dm, &guid("M7"), jane, true, t + 86_460, "Anytime!")?;
         f.conn.execute(
-            "UPDATE message SET thread_originator_guid = 'GUID-M1', thread_originator_part = '0:0:38' WHERE ROWID = ?1",
-            [reply],
+            "UPDATE message SET thread_originator_guid = ?1, thread_originator_part = '0:0:38' WHERE ROWID = ?2",
+            rusqlite::params![guid("M1"), reply],
         )?;
         f.conn.execute(
-            "UPDATE message SET text = 'Yes! See you at 7:30', date_edited = ?1 WHERE guid = 'GUID-M2'",
-            [apple_ns(t + 86_500)],
+            "UPDATE message SET text = 'Yes! See you at 7:30', date_edited = ?1 WHERE guid = ?2",
+            rusqlite::params![apple_ns(t + 86_500), guid("M2")],
         )?;
     }
     drop(f);
 
     let ab_path = work.path().join("AddressBook.sqlitedb");
-    let mut people: Vec<(&str, &str, &[&str])> = vec![("Jane", "Appleseed", &["+1 (555) 010-0000"])];
+    let mut people: Vec<(&str, &str, &[&str])> =
+        vec![("Jane", "Appleseed", &["+1 (555) 010-0000"])];
     if stage >= 2 {
         people.push(("Bob", "Builder", &["555-010-0001"]));
     }
@@ -195,8 +258,16 @@ pub fn build_sample_backup(
 
     let b = FixtureBackup::create(root, udid, password)?;
     b.write_info(udid, backup_date)?;
-    b.add_file(crate::backup::SMS_DB.0, crate::backup::SMS_DB.1, &std::fs::read(&sms_path)?)?;
-    b.add_file(crate::backup::ADDRESS_BOOK_DB.0, crate::backup::ADDRESS_BOOK_DB.1, &std::fs::read(&ab_path)?)?;
+    b.add_file(
+        crate::backup::SMS_DB.0,
+        crate::backup::SMS_DB.1,
+        &std::fs::read(&sms_path)?,
+    )?;
+    b.add_file(
+        crate::backup::ADDRESS_BOOK_DB.0,
+        crate::backup::ADDRESS_BOOK_DB.1,
+        &std::fs::read(&ab_path)?,
+    )?;
     // A tiny (fake) JPEG body.
     b.add_file("MediaDomain", &photo_path[2..], &[0xFF, 0xD8, 0xFF, 0xD9])?;
     b.finish()?;

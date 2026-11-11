@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use imsg_core::archive::{
-    self, CONTACTS_FILE, DeviceMeta, FORMAT_VERSION, SMS_DB_FILE, SNAPSHOT_META, SnapshotKind, SnapshotMeta,
+    self, CONTACTS_FILE, DeviceMeta, FORMAT_VERSION, SMS_DB_FILE, SNAPSHOT_META, SnapshotKind,
+    SnapshotMeta,
 };
 use imsg_core::backup::{ADDRESS_BOOK_DB, Backup, SMS_DB, attachment_file_id};
 use imsg_core::state::{Anchor, DeviceState, SnapshotSummary, State};
@@ -64,7 +65,11 @@ fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
 fn anchors_match(db: &Connection, anchors: &[Anchor]) -> Result<bool> {
     for a in anchors {
         let guid: Option<String> = db
-            .query_row("SELECT guid FROM message WHERE ROWID = ?1", [a.rowid], |r| r.get(0))
+            .query_row(
+                "SELECT guid FROM message WHERE ROWID = ?1",
+                [a.rowid],
+                |r| r.get(0),
+            )
             .optional()?;
         if guid.as_deref() == Some(a.guid.as_str()) {
             return Ok(true);
@@ -119,7 +124,10 @@ fn trim_messages(db: &Connection) -> Result<()> {
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     for t in triggers {
-        db.execute_batch(&format!("DROP TRIGGER IF EXISTS \"{}\";", t.replace('"', "\"\"")))?;
+        db.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS \"{}\";",
+            t.replace('"', "\"\"")
+        ))?;
     }
     db.execute_batch("PRAGMA foreign_keys = OFF;")?;
     db.execute_batch("DELETE FROM message WHERE ROWID NOT IN (SELECT id FROM temp.keep);")?;
@@ -127,7 +135,9 @@ fn trim_messages(db: &Connection) -> Result<()> {
     // Every other table keyed to messages (chat_message_join, message_attachment_join,
     // chat_recoverable_message_join, message_processing_task, ...).
     let tables: Vec<String> = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")?
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     for t in &tables {
@@ -161,11 +171,20 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
         info.device_name.as_deref().unwrap_or("unknown device"),
         info.udid,
         info.product_version.as_deref().unwrap_or("?"),
-        info.last_backup_date.map(|d| d.to_rfc3339()).unwrap_or_else(|| "unknown date".into()),
-        if backup.is_encrypted() { ", encrypted" } else { "" },
+        info.last_backup_date
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| "unknown date".into()),
+        if backup.is_encrypted() {
+            ", encrypted"
+        } else {
+            ""
+        },
     ));
 
-    let state_path = opts.state.clone().unwrap_or_else(|| default_state_path(&opts.out));
+    let state_path = opts
+        .state
+        .clone()
+        .unwrap_or_else(|| default_state_path(&opts.out));
     let mut state = State::load(&state_path)?;
     let mut dev: DeviceState = state.devices.get(&info.udid).cloned().unwrap_or_default();
 
@@ -175,7 +194,8 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
         && dev.last_backup_date == info.last_backup_date
         && dev.pending_attachments.is_empty()
     {
-        report.skipped = Some("backup has not changed since the last extraction (use --force)".into());
+        report.skipped =
+            Some("backup has not changed since the last extraction (use --force)".into());
         return Ok(report);
     }
 
@@ -193,14 +213,18 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
     let db = Connection::open(&sms)?;
     consolidate(&db)?;
 
-    let max_rowid: i64 = db.query_row("SELECT coalesce(max(ROWID), 0) FROM message", [], |r| r.get(0))?;
+    let max_rowid: i64 = db.query_row("SELECT coalesce(max(ROWID), 0) FROM message", [], |r| {
+        r.get(0)
+    })?;
     let had_history = dev.last_rowid > 0;
     let incremental = !opts.full && had_history && anchors_match(&db, &dev.anchors)?;
     if had_history && !incremental && !opts.full {
         report.fell_back_to_full = true;
-        log("Messages database no longer matches the previous extraction (restore or new phone?); \
+        log(
+            "Messages database no longer matches the previous extraction (restore or new phone?); \
              doing a full extraction. The server de-duplicates messages by GUID."
-            .into());
+                .into(),
+        );
     }
     let after_rowid = if incremental { dev.last_rowid } else { 0 };
 
@@ -213,11 +237,17 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
         [one] => format!("coalesce({one}, 0)"),
         many => format!(
             "max({})",
-            many.iter().map(|c| format!("coalesce({c}, 0)")).collect::<Vec<_>>().join(", ")
+            many.iter()
+                .map(|c| format!("coalesce({c}, 0)"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     };
-    let max_edit: i64 =
-        db.query_row(&format!("SELECT coalesce(max({edit_expr}), 0) FROM message"), [], |r| r.get(0))?;
+    let max_edit: i64 = db.query_row(
+        &format!("SELECT coalesce(max({edit_expr}), 0) FROM message"),
+        [],
+        |r| r.get(0),
+    )?;
 
     db.execute_batch("CREATE TEMP TABLE keep (id INTEGER PRIMARY KEY);")?;
     db.execute(
@@ -231,7 +261,11 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
     log(format!(
         "{} messages to export ({}; highest ROWID {max_rowid})",
         message_count,
-        if incremental { format!("incremental after ROWID {after_rowid}") } else { "full".into() }
+        if incremental {
+            format!("incremental after ROWID {after_rowid}")
+        } else {
+            "full".into()
+        }
     ));
 
     let snapshot_id = {
@@ -265,7 +299,11 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
     let mut pending = BTreeSet::new();
     let mut attachment_count = 0u64;
     if opts.attachments {
-        let wanted: BTreeSet<String> = file_ids.iter().chain(dev.pending_attachments.iter()).cloned().collect();
+        let wanted: BTreeSet<String> = file_ids
+            .iter()
+            .chain(dev.pending_attachments.iter())
+            .cloned()
+            .collect();
         for id in &wanted {
             let dest = archive::attachment_path(&device_dir, id);
             if dest.exists() {
@@ -339,7 +377,11 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
             ios_version: info.product_version.clone(),
             backup_date: info.last_backup_date,
             created_at: opts.now,
-            kind: if incremental { SnapshotKind::Incremental } else { SnapshotKind::Full },
+            kind: if incremental {
+                SnapshotKind::Incremental
+            } else {
+                SnapshotKind::Full
+            },
             after_rowid,
             max_rowid,
             message_count: message_count as u64,

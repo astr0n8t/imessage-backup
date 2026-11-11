@@ -116,7 +116,12 @@ impl Keybag {
             _ => password,
         };
         let mut passcode_key = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha1>(pre, self.attr("SALT")?, self.attr_u32("ITER")?, &mut passcode_key);
+        pbkdf2::pbkdf2_hmac::<Sha1>(
+            pre,
+            self.attr("SALT")?,
+            self.attr_u32("ITER")?,
+            &mut passcode_key,
+        );
 
         let mut unlocked = 0;
         for key in self.class_keys.values_mut() {
@@ -125,7 +130,10 @@ impl Keybag {
             }
             let k = aes_unwrap(&passcode_key, &key.wrapped)
                 .context("incorrect backup password (could not unwrap class key)")?;
-            key.key = Some(k.try_into().map_err(|_| anyhow!("unexpected class key length"))?);
+            key.key = Some(
+                k.try_into()
+                    .map_err(|_| anyhow!("unexpected class key length"))?,
+            );
             unlocked += 1;
         }
         if unlocked == 0 {
@@ -142,7 +150,8 @@ impl Keybag {
             .and_then(|c| c.key)
             .ok_or_else(|| anyhow!("no unlocked key for protection class {class}"))?;
         let key = aes_unwrap(&ck, wrapped)?;
-        key.try_into().map_err(|_| anyhow!("unexpected unwrapped key length"))
+        key.try_into()
+            .map_err(|_| anyhow!("unexpected unwrapped key length"))
     }
 }
 
@@ -150,13 +159,16 @@ const KW_IV: [u8; 8] = [0xA6; 8];
 
 /// RFC 3394 AES key unwrap with the default IV.
 pub fn aes_unwrap(kek: &[u8; 32], wrapped: &[u8]) -> Result<Vec<u8>> {
-    if wrapped.len() < 24 || wrapped.len() % 8 != 0 {
+    if wrapped.len() < 24 || !wrapped.len().is_multiple_of(8) {
         bail!("wrapped key has invalid length {}", wrapped.len());
     }
     let cipher = Aes256::new(GenericArray::from_slice(kek));
     let n = wrapped.len() / 8 - 1;
     let mut a: [u8; 8] = wrapped[..8].try_into().unwrap();
-    let mut r: Vec<[u8; 8]> = wrapped[8..].chunks(8).map(|c| c.try_into().unwrap()).collect();
+    let mut r: Vec<[u8; 8]> = wrapped[8..]
+        .chunks(8)
+        .map(|c| c.try_into().unwrap())
+        .collect();
     for j in (0..6).rev() {
         for i in (1..=n).rev() {
             let t = (n * j + i) as u64;
@@ -178,7 +190,7 @@ pub fn aes_unwrap(kek: &[u8; 32], wrapped: &[u8]) -> Result<Vec<u8>> {
 
 /// RFC 3394 AES key wrap (used to build test fixtures).
 pub fn aes_wrap(kek: &[u8; 32], key: &[u8]) -> Vec<u8> {
-    assert!(key.len() % 8 == 0 && key.len() >= 16);
+    assert!(key.len().is_multiple_of(8) && key.len() >= 16);
     let cipher = Aes256::new(GenericArray::from_slice(kek));
     let n = key.len() / 8;
     let mut a = KW_IV;
@@ -340,11 +352,13 @@ mod tests {
     #[test]
     fn rfc3394_vector() {
         // RFC 3394 section 4.6: 256-bit KEK wrapping 256-bit key.
-        let kek: [u8; 32] = hex::decode("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F")
-            .unwrap()
-            .try_into()
+        let kek: [u8; 32] =
+            hex::decode("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let key = hex::decode("00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F")
             .unwrap();
-        let key = hex::decode("00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F").unwrap();
         let expected = hex::decode(
             "28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21",
         )
@@ -368,7 +382,8 @@ mod tests {
             let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let enc = encrypt_bytes(&file_key, &data);
             let mut out = Vec::new();
-            let n = decrypt_stream(&file_key, &mut enc.as_slice(), &mut out, Some(len as u64)).unwrap();
+            let n =
+                decrypt_stream(&file_key, &mut enc.as_slice(), &mut out, Some(len as u64)).unwrap();
             assert_eq!(n as usize, len);
             assert_eq!(out, data);
             let mut out2 = Vec::new();

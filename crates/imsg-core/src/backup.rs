@@ -16,11 +16,14 @@ use crate::crypto::{self, Keybag};
 /// Domain/relative path of the Messages database inside a backup.
 pub const SMS_DB: (&str, &str) = ("HomeDomain", "Library/SMS/sms.db");
 /// Domain/relative path of the Contacts database inside a backup.
-pub const ADDRESS_BOOK_DB: (&str, &str) = ("HomeDomain", "Library/AddressBook/AddressBook.sqlitedb");
+pub const ADDRESS_BOOK_DB: (&str, &str) =
+    ("HomeDomain", "Library/AddressBook/AddressBook.sqlitedb");
 
 /// The default backup location used by Finder on macOS.
 pub fn default_backup_root() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join("Library/Application Support/MobileSync/Backup")
 }
 
@@ -134,7 +137,7 @@ pub fn list_backups(root: &Path) -> Result<Vec<(PathBuf, BackupInfo)>> {
             out.push((path, info));
         }
     }
-    out.sort_by(|a, b| b.1.last_backup_date.cmp(&a.1.last_backup_date));
+    out.sort_by_key(|b| std::cmp::Reverse(b.1.last_backup_date));
     Ok(out)
 }
 
@@ -157,7 +160,9 @@ struct FileCrypto {
 
 fn parse_mbfile(blob: &[u8]) -> Result<FileCrypto> {
     let value = Value::from_reader(std::io::Cursor::new(blob))?;
-    let dict = value.as_dictionary().ok_or_else(|| anyhow!("MBFile is not a dictionary"))?;
+    let dict = value
+        .as_dictionary()
+        .ok_or_else(|| anyhow!("MBFile is not a dictionary"))?;
     let objects = dict
         .get("$objects")
         .and_then(Value::as_array)
@@ -234,10 +239,17 @@ impl Backup {
                 &manifest_db,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            return Ok(Self { root: root.to_path_buf(), info, manifest, keybag: None, _tmp: None });
+            return Ok(Self {
+                root: root.to_path_buf(),
+                info,
+                manifest,
+                keybag: None,
+                _tmp: None,
+            });
         }
 
-        let password = password.ok_or_else(|| anyhow!("backup is encrypted; a password is required"))?;
+        let password =
+            password.ok_or_else(|| anyhow!("backup is encrypted; a password is required"))?;
         let manifest_plist = read_dict(&root.join("Manifest.plist"))?;
         let keybag_data = manifest_plist
             .get("BackupKeyBag")
@@ -266,7 +278,13 @@ impl Backup {
         manifest
             .query_row("SELECT count(*) FROM Files", [], |r| r.get::<_, i64>(0))
             .context("decrypted Manifest.db is not readable (wrong password?)")?;
-        Ok(Self { root: root.to_path_buf(), info, manifest, keybag: Some(keybag), _tmp: Some(tmp) })
+        Ok(Self {
+            root: root.to_path_buf(),
+            info,
+            manifest,
+            keybag: Some(keybag),
+            _tmp: Some(tmp),
+        })
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -328,10 +346,9 @@ impl Backup {
             let n = match &self.keybag {
                 None => std::io::copy(&mut input, &mut output)?,
                 Some(keybag) => {
-                    let blob = entry
-                        .file_blob
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("{} has no encryption metadata", entry.relative_path))?;
+                    let blob = entry.file_blob.as_deref().ok_or_else(|| {
+                        anyhow!("{} has no encryption metadata", entry.relative_path)
+                    })?;
                     let fc = parse_mbfile(blob)?;
                     let key = keybag.unwrap_key(fc.protection_class, &fc.wrapped_key)?;
                     crypto::decrypt_stream(&key, &mut input, &mut output, fc.size)?
@@ -346,7 +363,12 @@ impl Backup {
 
     /// Copy a SQLite database (plus its `-wal` journal, if backed up) into
     /// `dir`, returning the path of the main database file.
-    pub fn copy_sqlite(&self, domain: &str, relative_path: &str, dir: &Path) -> Result<Option<PathBuf>> {
+    pub fn copy_sqlite(
+        &self,
+        domain: &str,
+        relative_path: &str,
+        dir: &Path,
+    ) -> Result<Option<PathBuf>> {
         let Some(entry) = self.find(domain, relative_path)? else {
             return Ok(None);
         };
@@ -388,7 +410,11 @@ pub mod fixture {
                 let (bag, keys) = crypto::build_test_keybag(p.as_bytes(), &[1, 2, 3, 4]);
                 (hex::encode(bag), keys)
             });
-            let me = Self { root: root.to_path_buf(), manifest, encryption };
+            let me = Self {
+                root: root.to_path_buf(),
+                manifest,
+                encryption,
+            };
             me.write_info(udid, Utc::now())?;
             Ok(me)
         }
@@ -436,7 +462,8 @@ pub mod fixture {
         pub fn finish(&self) -> Result<()> {
             let plain = self.root.join("Manifest.db.plain");
             let _ = fs::remove_file(&plain);
-            self.manifest.execute("VACUUM INTO ?1", [plain.to_string_lossy()])?;
+            self.manifest
+                .execute("VACUUM INTO ?1", [plain.to_string_lossy()])?;
             let mut mp = plist::Dictionary::new();
             match &self.encryption {
                 None => {
@@ -446,7 +473,10 @@ pub mod fixture {
                 Some((bag, keys)) => {
                     let mkey = [0x5Au8; 32];
                     let data = fs::read(&plain)?;
-                    fs::write(self.root.join("Manifest.db"), crypto::encrypt_bytes(&mkey, &data))?;
+                    fs::write(
+                        self.root.join("Manifest.db"),
+                        crypto::encrypt_bytes(&mkey, &data),
+                    )?;
                     fs::remove_file(&plain)?;
                     let mut mk = 4u32.to_le_bytes().to_vec();
                     mk.extend(crypto::aes_wrap(&keys[&4], &mkey));
@@ -495,13 +525,19 @@ mod tests {
         let p = "~/Library/SMS/Attachments/ab/11/GUID/IMG_0001.HEIC";
         assert_eq!(
             attachment_file_id(p).unwrap(),
-            file_id("MediaDomain", "Library/SMS/Attachments/ab/11/GUID/IMG_0001.HEIC")
+            file_id(
+                "MediaDomain",
+                "Library/SMS/Attachments/ab/11/GUID/IMG_0001.HEIC"
+            )
         );
         assert_eq!(
             attachment_file_id("/var/mobile/Library/SMS/Attachments/x.jpg"),
             attachment_file_id("~/Library/SMS/Attachments/x.jpg")
         );
-        assert_eq!(file_id(SMS_DB.0, SMS_DB.1), "3d0d7e5fb2ce288813306e4d4636395e047a3d28");
+        assert_eq!(
+            file_id(SMS_DB.0, SMS_DB.1),
+            "3d0d7e5fb2ce288813306e4d4636395e047a3d28"
+        );
         assert_eq!(
             file_id(ADDRESS_BOOK_DB.0, ADDRESS_BOOK_DB.1),
             "31bb7ba8914766d4ba40d6dfb6113c8b614be442"
@@ -513,7 +549,8 @@ mod tests {
         let root = dir.path().join("00008110-TEST");
         let fx = FixtureBackup::create(&root, "00008110-test", password).unwrap();
         let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 253) as u8).collect();
-        fx.add_file("MediaDomain", "Library/SMS/Attachments/a/b/c.jpg", &payload).unwrap();
+        fx.add_file("MediaDomain", "Library/SMS/Attachments/a/b/c.jpg", &payload)
+            .unwrap();
         fx.finish().unwrap();
 
         assert!(Backup::open(&root, Some("nope")).is_err() || password.is_none());
