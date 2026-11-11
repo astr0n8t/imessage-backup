@@ -40,8 +40,17 @@ function withView(url) {
   return `${url}${url.includes("?") ? "&" : "?"}as=${encodeURIComponent(state.viewAs)}`;
 }
 
+function setOffline(off) { $("#offline").hidden = !off; }
+
 async function api(path, opts) {
-  const r = await fetch(path === "/api/me" ? path : withView(path), { credentials: "same-origin", ...opts });
+  let r;
+  try {
+    r = await fetch(path === "/api/me" ? path : withView(path), { credentials: "same-origin", ...opts });
+  } catch (e) {
+    setOffline(true);
+    throw e;
+  }
+  setOffline(false);
   if (r.status === 401) {
     location.href = "/login";
     throw new Error("signed out");
@@ -182,7 +191,7 @@ function attachmentNode(p) {
   if (!p.file) return missing();
   const src = withView(`/media/${p.file}`);
   if (mime.startsWith("image/") || /\.(heic|jpe?g|png|gif|webp)$/i.test(name)) {
-    const img = el("img", { src, alt: name, loading: "lazy", onclick: () => window.open(src, "_blank", "noopener") });
+    const img = el("img", { src, alt: name, loading: "lazy", onclick: () => openLightbox(src, name) });
     img.addEventListener("error", () => img.parentNode && img.parentNode.replaceWith(el("a", { class: "file", href: `${src}${src.includes("?") ? "&" : "?"}dl=1`, text: `🖼 ${name} ${size(p.size)}` })));
     return el("div", { class: "media" + (p.sticker ? " sticker" : "") }, img);
   }
@@ -276,6 +285,19 @@ function renderMessage(m, prev) {
     meta.forEach((x, i) => { if (i) md.append(" · "); md.append(x); });
     row.append(md);
   }
+  // Tap a message for details that a mouse would get from tooltips.
+  const detail = el("div", { class: "detail" },
+    el("div", { text: `${m.from_me ? "Sent" : "Received"} ${fullFmt.format(m.date_ms)}${m.service ? ` · ${m.service}` : ""}` }),
+    m.from_me && m.delivered_ms ? el("div", { text: `Delivered ${fullFmt.format(m.delivered_ms)}` }) : null,
+    m.from_me && m.read_ms ? el("div", { text: `Read ${fullFmt.format(m.read_ms)}` }) : null,
+    ...history.map((h) => el("div", { text: `Edited ${fullFmt.format(h.ms)}: “${h.text}”` })),
+    m.edited_ms && !history.length ? el("div", { text: `Edited ${fullFmt.format(m.edited_ms)}` }) : null,
+    ...(m.reactions || []).map((x) => el("div", { text: `${x.emoji === "sticker" ? "Sticker" : x.emoji} from ${x.name}` })));
+  row.append(detail);
+  wrap.addEventListener("click", (ev) => {
+    if (ev.target.closest("a, video, audio, img, button")) return;
+    row.classList.toggle("show-detail");
+  });
   frag.append(row);
   return frag;
 }
@@ -382,6 +404,26 @@ function jumpTo(messageId) {
   }
 }
 
+// ---- Photo viewer ------------------------------------------------------
+// Full-screen in-app viewer (opening a new tab would leave an installed app).
+// It pushes a history entry so the phone's back gesture closes it.
+function openLightbox(src, name) {
+  const box = $("#lightbox");
+  const img = el("img", { src, alt: name });
+  const dl = `${src}${src.includes("?") ? "&" : "?"}dl=1`;
+  box.replaceChildren(img, el("div", { class: "lightbox-bar" },
+    el("button", { type: "button", "aria-label": "Close", text: "✕", onclick: () => history.back() }),
+    el("a", { href: dl, text: "Save" })));
+  img.addEventListener("click", () => history.back());
+  history.pushState({ lightbox: true }, "");
+  box.showModal();
+}
+window.addEventListener("popstate", () => {
+  const box = $("#lightbox");
+  if (box.open) box.close();
+});
+$("#lightbox").addEventListener("cancel", (ev) => { ev.preventDefault(); history.back(); });
+
 // ---- Status --------------------------------------------------------------
 async function showStatus() {
   const s = await api("/api/status");
@@ -395,10 +437,10 @@ async function showStatus() {
   if (state.me && state.me.admin) {
     const ids = await api("/api/identities");
     identities = [el("h3", { text: "Devices & iMessage IDs (for the accounts file)" }),
-      el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device UDID" }), el("th", { text: "Name" }), el("th", { text: "iMessage IDs used" }))),
+      el("div", { class: "table-scroll" }, el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device UDID" }), el("th", { text: "Name" }), el("th", { text: "iMessage IDs used" }))),
         el("tbody", {}, ids.map((d) => el("tr", {},
           el("td", {}, el("code", { text: d.device })), el("td", { text: d.device_name || "" }),
-          el("td", { text: d.imessage_ids.map(([id, n]) => `${id || "(unknown)"} (${n})`).join(", ") })))))];
+          el("td", { text: d.imessage_ids.map(([id, n]) => `${id || "(unknown)"} (${n})`).join(", ") }))))))];
   }
   body.replaceChildren(
     el("p", { text: who }),
@@ -406,7 +448,7 @@ async function showStatus() {
     el("p", { text: `Transcoding: ${s.transcoding}` }),
     s.last_scan ? el("p", { text: `Last scan ${fullFmt.format(new Date(s.last_scan.at))}: ${s.last_scan.report.snapshots} new snapshot(s), ${s.last_scan.report.waiting} waiting for files, ${s.last_scan.report.failed} failed` }) : null,
     el("h3", { text: "Snapshots" }),
-    el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device" }), el("th", { text: "Snapshot" }), el("th", { text: "Backup" }), el("th", { text: "Messages" }))), el("tbody", {}, rows)),
+    el("div", { class: "table-scroll" }, el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device" }), el("th", { text: "Snapshot" }), el("th", { text: "Backup" }), el("th", { text: "Messages" }))), el("tbody", {}, rows))),
     ...(identities || []));
   const d = $("#status-dialog");
   if (!d.open) d.showModal();
@@ -463,6 +505,37 @@ async function loadMe() {
     if (location.hash) location.hash = ""; else route();
     await loadConversations();
   });
+}
+
+// ---- Installed-app (PWA) behaviour --------------------------------------
+let lastListLoad = Date.now();
+document.addEventListener("visibilitychange", () => {
+  // Phones keep installed apps suspended for a long time; refresh on return.
+  if (document.visibilityState === "visible" && Date.now() - lastListLoad > 60e3) {
+    lastListLoad = Date.now();
+    loadConversations().catch(() => {});
+  }
+});
+window.addEventListener("online", () => { setOffline(false); loadConversations().catch(() => {}); });
+window.addEventListener("offline", () => setOffline(true));
+
+let installPrompt = null;
+window.addEventListener("beforeinstallprompt", (ev) => {
+  ev.preventDefault();
+  installPrompt = ev;
+  $("#install-btn").hidden = false;
+});
+$("#install-btn").addEventListener("click", async () => {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  await installPrompt.userChoice.catch(() => {});
+  installPrompt = null;
+  $("#install-btn").hidden = true;
+});
+window.addEventListener("appinstalled", () => { $("#install-btn").hidden = true; });
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch((e) => console.warn("service worker:", e));
 }
 
 loadMe().then(loadConversations).then(route).catch((e) => console.error(e));

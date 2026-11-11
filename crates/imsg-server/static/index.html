@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
 <title>Messages Archive</title>
-<link rel="stylesheet" href="/static/app.css">
+{{head}}
 </head>
 <body>
 <div id="app">
@@ -13,6 +13,7 @@
     <header class="side-head">
       <h1>Messages</h1>
       <div class="side-actions">
+        <button id="install-btn" class="text-btn" hidden>Install</button>
         <button id="status-btn" class="icon-btn" title="Archive status" aria-label="Archive status">ⓘ</button>
         <form method="post" action="/logout"><button class="text-btn">Sign out</button></form>
       </div>
@@ -38,11 +39,13 @@
     <div id="messages"><div class="empty">Select a conversation</div></div>
   </main>
 </div>
+<div id="offline" role="status" hidden>Offline: can't reach the server</div>
+<dialog id="lightbox" aria-label="Photo"></dialog>
 <dialog id="status-dialog">
   <form method="dialog" class="dialog-head"><h2>Archive status</h2><button class="icon-btn" aria-label="Close">✕</button></form>
   <div id="status-body"></div>
   <button id="rescan-btn">Scan for new snapshots</button>
 </dialog>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v={{v}}"></script>
 </body>
 </html>

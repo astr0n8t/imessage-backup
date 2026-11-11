@@ -209,8 +209,119 @@ impl FromRequestParts<Arc<AppState>> for Viewer {
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const LOGIN_HTML: &str = include_str!("../static/login.html");
 const TOTP_HTML: &str = include_str!("../static/totp.html");
+const OFFLINE_HTML: &str = include_str!("../static/offline.html");
 const APP_JS: &str = include_str!("../static/app.js");
 const APP_CSS: &str = include_str!("../static/app.css");
+const SW_JS: &str = include_str!("../static/sw.js");
+const MANIFEST: &str = include_str!("../static/manifest.webmanifest");
+const ICONS: &[(&str, &[u8])] = &[
+    (
+        "icon-192.png",
+        include_bytes!("../static/icons/icon-192.png"),
+    ),
+    (
+        "icon-512.png",
+        include_bytes!("../static/icons/icon-512.png"),
+    ),
+    (
+        "icon-maskable-512.png",
+        include_bytes!("../static/icons/icon-maskable-512.png"),
+    ),
+    (
+        "apple-touch-icon.png",
+        include_bytes!("../static/icons/apple-touch-icon.png"),
+    ),
+    (
+        "favicon-32.png",
+        include_bytes!("../static/icons/favicon-32.png"),
+    ),
+];
+
+/// Pages and scripts with the shared `<head>` and the asset version filled in.
+/// The version is a hash of every bundled asset, so a new build busts browser
+/// caches and makes installed apps pick up the new service worker.
+struct Assets {
+    version: String,
+    index: String,
+    login: String,
+    totp: String,
+    offline: String,
+    sw: String,
+}
+
+static ASSETS: std::sync::LazyLock<Assets> = std::sync::LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [
+        INDEX_HTML,
+        LOGIN_HTML,
+        TOTP_HTML,
+        OFFLINE_HTML,
+        APP_JS,
+        APP_CSS,
+        SW_JS,
+        MANIFEST,
+    ] {
+        h.update(part.as_bytes());
+    }
+    for (_, bytes) in ICONS {
+        h.update(bytes);
+    }
+    let version = hex::encode(&h.finalize()[..6]);
+    let head = format!(
+        r##"<link rel="stylesheet" href="/static/app.css?v={version}">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#232326" media="(prefers-color-scheme: dark)">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Messages">
+<meta name="format-detection" content="telephone=no">"##
+    );
+    let fill = |page: &str| page.replace("{{head}}", &head).replace("{{v}}", &version);
+    Assets {
+        index: fill(INDEX_HTML),
+        login: fill(LOGIN_HTML),
+        totp: fill(TOTP_HTML),
+        offline: fill(OFFLINE_HTML),
+        sw: SW_JS.replace("{{v}}", &version),
+        version,
+    }
+});
+
+/// Bundled, versioned asset: cache for a year (URLs change with the version).
+fn immutable(content_type: &'static str, body: impl IntoResponse) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn icon(name: &str) -> Response {
+    match ICONS.iter().find(|(n, _)| *n == name) {
+        Some((_, bytes)) => (
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            *bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The asset version, e.g. for diagnostics.
+pub fn asset_version() -> &'static str {
+    &ASSETS.version
+}
 
 async fn security_headers(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
@@ -236,16 +347,49 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/logout", post(logout))
         .route(
             "/static/app.js",
+            get(|| async { immutable("text/javascript; charset=utf-8", APP_JS) }),
+        )
+        .route(
+            "/static/app.css",
+            get(|| async { immutable("text/css; charset=utf-8", APP_CSS) }),
+        )
+        .route(
+            "/static/icons/{name}",
+            get(|name: UrlPath<String>| async move { icon(&name) }),
+        )
+        .route(
+            "/apple-touch-icon.png",
+            get(|| async { icon("apple-touch-icon.png") }),
+        )
+        .route("/favicon.ico", get(|| async { icon("favicon-32.png") }))
+        .route(
+            "/manifest.webmanifest",
             get(|| async {
                 (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    APP_JS,
+                    [
+                        (header::CONTENT_TYPE, "application/manifest+json"),
+                        (header::CACHE_CONTROL, "public, max-age=3600"),
+                    ],
+                    MANIFEST,
                 )
             }),
         )
         .route(
-            "/static/app.css",
-            get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }),
+            "/sw.js",
+            // Never cache the worker itself, so updates are noticed promptly.
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    ASSETS.sw.as_str(),
+                )
+            }),
+        )
+        .route(
+            "/offline.html",
+            get(|| async { Html(ASSETS.offline.as_str()) }),
         )
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/me", get(api_me))
@@ -269,7 +413,7 @@ fn no_store(mut r: Response) -> Response {
 
 async fn index_page(user: Result<Viewer, AppError>) -> Response {
     match user {
-        Ok(_) => no_store(Html(INDEX_HTML).into_response()),
+        Ok(_) => no_store(Html(ASSETS.index.as_str()).into_response()),
         Err(_) => Redirect::to("/login").into_response(),
     }
 }
@@ -288,7 +432,7 @@ async fn login_page(Query(q): Query<LoginQuery>) -> Response {
         Some(_) => "Incorrect username or password.",
         None => "",
     };
-    no_store(Html(LOGIN_HTML.replace("{{error}}", msg)).into_response())
+    no_store(Html(ASSETS.login.replace("{{error}}", msg)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -398,7 +542,7 @@ async fn totp_page(headers: HeaderMap, Query(q): Query<LoginQuery>) -> Response 
         Some(_) => "That code didn't work. Check your authenticator app and try again.",
         None => "",
     };
-    no_store(Html(TOTP_HTML.replace("{{error}}", msg)).into_response())
+    no_store(Html(ASSETS.totp.replace("{{error}}", msg)).into_response())
 }
 
 #[derive(Deserialize)]
