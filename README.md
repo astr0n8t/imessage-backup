@@ -169,7 +169,7 @@ After a restart, that account signs in with password and then code. Details:
 
 * Codes are standard RFC 6238 (SHA-1, 30 s, 6 digits), and one step of clock drift either way is accepted. Keep
   the server's clock in sync (NTP).
-* Each code works only once. The code step lasts 5 minutes and allows 5 tries, after which the password must be
+* Each code works only once. After the password is accepted you have 5 minutes and 5 tries to enter a code, after which the password must be
   entered again. Wrong codes count towards the per-IP lockout, and a correct password doesn't reset that count.
 * `--require-totp` (or `IMSG_REQUIRE_TOTP=1`) makes the server refuse to start while any account has no
   `totp_secret`. Without it, accounts lacking a secret are listed in the startup log.
