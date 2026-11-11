@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/imsg-core", "crates/imsg-extract", "crates/imsg-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+imsg-core = { path = "crates/imsg-core" }
+# Must match the rusqlite version pinned by imessage-database so Connection types line up.
+rusqlite = { version = "=0.41.1", features = ["bundled", "blob"] }
+imessage-database = "=5.0.1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"

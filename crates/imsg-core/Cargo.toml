@@ -1,0 +1,20 @@
+[package]
+name = "imsg-core"
+description = "Shared iOS backup reader, archive layout and contacts parsing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+plist = "1"
+hex = "0.4"
+sha1 = "0.10"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+aes = "0.8"
