@@ -389,7 +389,8 @@ async function showStatus() {
   const rows = s.snapshots.map((x) => el("tr", {},
     el("td", { text: x.device_name ? `${x.device_name} (${x.device})` : x.device }), el("td", { text: x.snapshot_id }),
     el("td", { text: x.backup_ms ? fullFmt.format(x.backup_ms) : "" }), el("td", { text: x.messages.toLocaleString() })));
-  const who = state.me ? `Signed in as ${state.me.name}${state.viewAs ? ` · viewing ${state.viewAs}` : ""}` : "";
+  const who = state.me ? `Signed in as ${state.me.name}${state.viewAs ? ` · viewing ${state.viewAs}` : ""} · ` +
+    `two-factor ${state.me.totp ? "on" : "off"}` : "";
   let identities = null;
   if (state.me && state.me.admin) {
     const ids = await api("/api/identities");

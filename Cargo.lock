@@ -383,6 +383,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
 name = "deranged"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -737,16 +743,20 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "data-encoding",
  "hex",
+ "hmac",
  "http-body-util",
  "imessage-database",
  "imsg-core",
  "imsg-extract",
+ "qrcode",
  "rand",
  "rpassword",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "sha2",
  "tempfile",
  "tokio",
@@ -1019,6 +1029,12 @@ checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"

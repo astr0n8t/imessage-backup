@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use imsg_server::auth::{Accounts, hash_password};
 use imsg_server::index::Index;
 use imsg_server::media::Tools;
+use imsg_server::totp::{self, Secret};
 use imsg_server::web::{AppState, router};
 use tracing::{info, warn};
 
@@ -59,6 +60,9 @@ enum Command {
         /// Use X-Forwarded-For for login throttling (only behind a trusted proxy).
         #[arg(long, env = "IMSG_TRUST_FORWARDED_FOR")]
         trust_forwarded_for: bool,
+        /// Refuse to start unless every account has a `totp_secret`.
+        #[arg(long, env = "IMSG_REQUIRE_TOTP")]
+        require_totp: bool,
         /// Days a login stays valid.
         #[arg(long, default_value_t = 30)]
         session_days: u64,
@@ -67,6 +71,23 @@ enum Command {
     Ingest {
         #[command(flatten)]
         paths: Paths,
+    },
+    /// Generate a TOTP (authenticator app) secret for an account: shows a QR
+    /// code to scan, checks a code from the app, and prints the
+    /// `totp_secret = "..."` line to add to that account in the accounts file.
+    TotpSecret {
+        /// Account name (shown in the authenticator app).
+        #[arg(short, long)]
+        user: String,
+        /// Issuer label shown in the authenticator app.
+        #[arg(long, default_value = "Messages Archive")]
+        issuer: String,
+        /// Don't ask for a code to confirm the app was set up correctly.
+        #[arg(long)]
+        no_verify: bool,
+        /// Draw the QR code for a light terminal background.
+        #[arg(long)]
+        invert: bool,
     },
     /// List each archived device and the iMessage IDs / numbers its messages
     /// used (ingesting new snapshots first), to help write the accounts file.
@@ -129,9 +150,47 @@ async fn main() -> Result<()> {
                      devices = []\n\
                      # This person's phone numbers / Apple IDs; their messages from any device are visible.\n\
                      imessage_ids = []\n\
-                     admin = false\n"
+                     admin = false\n\
+                     # Optional two-factor authentication: `imsg-server totp-secret --user {user}`\n\
+                     # totp_secret = \"...\"\n"
                 );
             }
+        }
+        Command::TotpSecret {
+            user,
+            issuer,
+            no_verify,
+            invert,
+        } => {
+            let secret = Secret::generate();
+            let uri = secret.uri(&issuer, &user);
+            eprintln!("Scan this QR code with your authenticator app:\n");
+            eprintln!("{}", totp::qr_text(&uri, invert)?);
+            eprintln!("(If it won't scan, try --invert, or add the key below by hand.)");
+            eprintln!("Or enter this key manually: {}\n", secret.to_base32());
+            if !no_verify {
+                loop {
+                    eprint!("Enter the 6-digit code the app shows (blank to skip): ");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let code = line.trim();
+                    if code.is_empty() {
+                        eprintln!("Skipped verification.");
+                        break;
+                    }
+                    if secret.matching_step(code, totp::now()).is_some() {
+                        eprintln!("Code accepted.");
+                        break;
+                    }
+                    eprintln!(
+                        "That code doesn't match. Check the app and this machine's clock, then try again."
+                    );
+                }
+            }
+            eprintln!(
+                "\nAdd this line to the [[account]] entry for {user:?}, then restart the server:\n"
+            );
+            println!("totp_secret = \"{}\"", secret.to_base32());
         }
         Command::Identities { paths } => {
             let index = Index::open(&paths.state_dir().join("index.sqlite"))?;
@@ -173,6 +232,7 @@ async fn main() -> Result<()> {
             scan_interval,
             secure_cookies,
             trust_forwarded_for,
+            require_totp,
             session_days,
         } => {
             let accounts = Accounts::load(&auth_file)?;
@@ -180,6 +240,23 @@ async fn main() -> Result<()> {
                 bail!(
                     "{} contains no accounts; add one with `imsg-server hash-password`",
                     auth_file.display()
+                );
+            }
+            let without: Vec<&str> = accounts
+                .iter()
+                .filter(|a| a.totp.is_none())
+                .map(|a| a.name.as_str())
+                .collect();
+            if require_totp && !without.is_empty() {
+                bail!(
+                    "--require-totp is set but these accounts have no totp_secret: {} (create one with `imsg-server totp-secret --user <name>`)",
+                    without.join(", ")
+                );
+            }
+            if !without.is_empty() {
+                info!(
+                    "accounts without two-factor authentication: {}",
+                    without.join(", ")
                 );
             }
             if !paths.data.is_dir() {

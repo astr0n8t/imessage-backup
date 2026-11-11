@@ -48,6 +48,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .login-card label { display: block; margin: 12px 0; color: var(--muted); font-size: 13px; }
 .login-card input { display: block; width: 100%; margin-top: 4px; padding: 10px 12px; font: inherit; border-radius: 10px; border: 1px solid var(--border); background: var(--side-bg); color: var(--text); }
 .login-card button { width: 100%; margin-top: 8px; padding: 10px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; font-weight: 600; }
+.login-hint { color: var(--muted); font-size: 13px; margin: 0 0 8px; }
+.login-hint a { color: var(--accent); }
 .login-error { color: #ff453a; min-height: 1em; margin: 0; font-size: 13px; }
 
 /* Layout */
@@ -149,3 +151,4 @@ dialog::backdrop { background: rgba(0,0,0,.35); }
   #back-btn { display: block; }
   .bubble-wrap { max-width: 85%; }
 }
+.login-card form + .login-hint { margin-top: 14px; }
