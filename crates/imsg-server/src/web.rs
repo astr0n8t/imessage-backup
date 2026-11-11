@@ -15,10 +15,13 @@ use axum::{Form, Json, Router};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::auth::{self, Accounts, COOKIE, Throttle};
+use crate::auth::{
+    self, Accounts, COOKIE, PENDING_COOKIE, PENDING_TTL, PendingCheck, PendingLogins, Throttle,
+};
 use crate::index::{Index, IngestReport};
 use crate::media::{self, ServeRequest, Tools};
 use crate::queries::{self, Cursor, Names};
+use crate::totp::ReplayGuard;
 use crate::view::View;
 
 pub struct AppState {
@@ -27,6 +30,8 @@ pub struct AppState {
     pub cache: PathBuf,
     pub accounts: Accounts,
     pub throttle: Throttle,
+    pub pending: PendingLogins,
+    pub totp_replay: ReplayGuard,
     /// Contact names per account view, rebuilt lazily after each ingest.
     pub names: RwLock<HashMap<String, Arc<Names>>>,
     pub tools: Tools,
@@ -57,6 +62,8 @@ impl AppState {
             cache,
             accounts,
             throttle: Throttle::default(),
+            pending: PendingLogins::default(),
+            totp_replay: ReplayGuard::default(),
             names: RwLock::new(HashMap::new()),
             tools,
             secure_cookies,
@@ -201,6 +208,7 @@ impl FromRequestParts<Arc<AppState>> for Viewer {
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const LOGIN_HTML: &str = include_str!("../static/login.html");
+const TOTP_HTML: &str = include_str!("../static/totp.html");
 const APP_JS: &str = include_str!("../static/app.js");
 const APP_CSS: &str = include_str!("../static/app.css");
 
@@ -224,6 +232,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index_page))
         .route("/login", get(login_page).post(login))
+        .route("/login/totp", get(totp_page).post(login_totp))
         .route("/logout", post(logout))
         .route(
             "/static/app.js",
@@ -273,6 +282,9 @@ struct LoginQuery {
 async fn login_page(Query(q): Query<LoginQuery>) -> Response {
     let msg = match q.error.as_deref() {
         Some("locked") => "Too many failed attempts. Try again later.",
+        Some("expired") => {
+            "Your sign-in timed out or had too many wrong codes. Please sign in again."
+        }
         Some(_) => "Incorrect username or password.",
         None => "",
     };
@@ -325,17 +337,114 @@ async fn login(
         tokio::time::sleep(Duration::from_millis(500)).await;
         return Ok(Redirect::to("/login?error=1").into_response());
     }
+    let needs_code = st
+        .accounts
+        .get(&form.username)
+        .is_some_and(|a| a.totp.is_some());
+    if needs_code {
+        // Don't reset the failure counter yet: the code still has to be right.
+        let token = st.pending.start(&form.username);
+        info!(%ip, user = %form.username, "password accepted; waiting for TOTP code");
+        let mut resp = Redirect::to("/login/totp").into_response();
+        resp.headers_mut().insert(
+            header::SET_COOKIE,
+            pending_cookie(&st, &token, PENDING_TTL.as_secs()),
+        );
+        return Ok(resp);
+    }
+    finish_login(&st, ip, form.username).await
+}
+
+/// Create the session after every factor checked out.
+async fn finish_login(st: &Arc<AppState>, ip: IpAddr, user: String) -> Result<Response, AppError> {
     st.throttle.succeed(ip);
     let ttl = st.session_ttl;
-    let user = form.username.clone();
-    let token = with_conn(&st, move |c| auth::create_session(c, &user, ttl)).await?;
-    info!(%ip, user = %form.username, "signed in");
+    let u = user.clone();
+    let token = with_conn(st, move |c| auth::create_session(c, &u, ttl)).await?;
+    info!(%ip, %user, "signed in");
     let mut resp = Redirect::to("/").into_response();
-    resp.headers_mut().insert(
+    resp.headers_mut().append(
         header::SET_COOKIE,
-        session_cookie(&st, &token, ttl.as_secs()),
+        session_cookie(st, &token, ttl.as_secs()),
     );
+    resp.headers_mut()
+        .append(header::SET_COOKIE, pending_cookie(st, "", 0));
     Ok(resp)
+}
+
+fn pending_cookie(st: &AppState, value: &str, max_age: u64) -> HeaderValue {
+    let secure = if st.secure_cookies { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{PENDING_COOKIE}={value}; Path=/login; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}"
+    ))
+    .unwrap()
+}
+
+fn pending_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|h| auth::named_cookie_token(h, PENDING_COOKIE))
+        .map(str::to_owned)
+}
+
+async fn totp_page(headers: HeaderMap, Query(q): Query<LoginQuery>) -> Response {
+    if pending_token(&headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    let msg = match q.error.as_deref() {
+        Some("locked") => "Too many failed attempts. Try again later.",
+        Some(_) => "That code didn't work. Check your authenticator app and try again.",
+        None => "",
+    };
+    no_store(Html(TOTP_HTML.replace("{{error}}", msg)).into_response())
+}
+
+#[derive(Deserialize)]
+struct TotpForm {
+    code: String,
+}
+
+async fn login_totp(
+    State(st): St,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<TotpForm>,
+) -> Result<Response, AppError> {
+    let ip = client_ip(&st, &headers, peer);
+    if st.throttle.blocked(ip) {
+        return Ok(Redirect::to("/login/totp?error=locked").into_response());
+    }
+    let Some(token) = pending_token(&headers) else {
+        return Ok(Redirect::to("/login?error=expired").into_response());
+    };
+    let user = match st.pending.attempt(&token) {
+        PendingCheck::User(u) => u,
+        PendingCheck::Missing => {
+            let mut resp = Redirect::to("/login?error=expired").into_response();
+            resp.headers_mut()
+                .insert(header::SET_COOKIE, pending_cookie(&st, "", 0));
+            return Ok(resp);
+        }
+    };
+    let step = st
+        .accounts
+        .get(&user)
+        .and_then(|a| a.totp.as_ref())
+        .and_then(|secret| secret.matching_step(&form.code, crate::totp::now()));
+    match step {
+        Some(step) if st.totp_replay.accept(&user, step) => {
+            st.pending.finish(&token);
+            finish_login(&st, ip, user).await
+        }
+        _ => {
+            st.throttle.fail(ip);
+            warn!(%ip, %user, "wrong or reused TOTP code");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(Redirect::to("/login/totp?error=1").into_response())
+        }
+    }
 }
 
 async fn logout(State(st): St, headers: HeaderMap) -> Result<Response, AppError> {
@@ -360,6 +469,7 @@ async fn api_me(v: Viewer, State(st): St) -> Result<Response, AppError> {
             .map(|a| {
                 serde_json::json!({
                     "name": a.name, "admin": a.admin, "devices": a.devices, "imessage_ids": a.imessage_ids,
+                    "totp": a.totp.is_some(),
                 })
             })
             .collect()
@@ -369,6 +479,7 @@ async fn api_me(v: Viewer, State(st): St) -> Result<Response, AppError> {
     Ok(no_store(
         Json(serde_json::json!({
             "name": v.account, "admin": v.admin, "viewing": v.viewing, "accounts": accounts,
+            "totp": st.accounts.get(&v.account).is_some_and(|a| a.totp.is_some()),
         }))
         .into_response(),
     ))

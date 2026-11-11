@@ -32,6 +32,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rpassword = "7"
 toml = "0.9"
+qrcode = { version = "0.14", default-features = false }
+data-encoding = "2"
+hmac = "0.12"
+sha1 = "0.10"
 
 [dev-dependencies]
 tempfile.workspace = true

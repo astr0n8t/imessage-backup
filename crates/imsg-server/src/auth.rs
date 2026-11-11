@@ -10,6 +10,7 @@
 //! devices = ["00008110-000A1B2C3D4E5F6A"] # device UDIDs whose backups she sees ("*" = all)
 //! imessage_ids = ["+15550109999", "alice@icloud.com"]  # her numbers / Apple IDs, on any device
 //! admin = false                           # admins may also view other accounts
+//! totp_secret = "JBSWY3DPEHPK3PXP..."     # optional: require a 6-digit code (`imsg-server totp-secret`)
 //! ```
 //!
 //! The older one-line-per-user format (`username:$argon2id$...`) is still
@@ -31,6 +32,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::totp::Secret;
 use crate::view::View;
 
 pub const COOKIE: &str = "imsg_session";
@@ -46,6 +48,8 @@ pub struct AccountConfig {
     pub imessage_ids: Vec<String>,
     #[serde(default)]
     pub admin: bool,
+    #[serde(default)]
+    pub totp_secret: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +67,8 @@ pub struct Account {
     pub devices: Vec<String>,
     pub imessage_ids: Vec<String>,
     pub view: View,
+    /// When set, logging in also needs a current TOTP code.
+    pub totp: Option<Secret>,
 }
 
 /// All configured accounts.
@@ -104,6 +110,7 @@ impl Accounts {
                         devices: vec!["*".into()],
                         imessage_ids: vec![],
                         view: View::everything(),
+                        totp: None,
                     },
                 );
             }
@@ -122,6 +129,10 @@ impl Accounts {
                 if accounts.contains_key(&a.name) {
                     bail!("{what} is defined twice");
                 }
+                let totp = match a.totp_secret.as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(s) => Some(Secret::parse(s).with_context(|| what.clone())?),
+                };
                 accounts.insert(
                     a.name.clone(),
                     Account {
@@ -131,6 +142,7 @@ impl Accounts {
                         devices: a.devices,
                         imessage_ids: a.imessage_ids,
                         view,
+                        totp,
                     },
                 );
             }
@@ -228,12 +240,7 @@ pub fn delete_session(conn: &Connection, token: &str) -> Result<()> {
 
 /// Extract our session cookie from a `Cookie:` header value.
 pub fn cookie_token(header: &str) -> Option<&str> {
-    header
-        .split(';')
-        .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == COOKIE)
-        .map(|(_, v)| v)
-        .filter(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
+    named_cookie_token(header, COOKIE)
 }
 
 /// Simple per-IP lockout: `MAX_FAILURES` failed logins within `WINDOW` blocks
@@ -262,6 +269,80 @@ impl Throttle {
     pub fn succeed(&self, ip: IpAddr) {
         self.failures.lock().unwrap().remove(&ip);
     }
+}
+
+/// Logins that passed the password check and are waiting for a TOTP code.
+/// Held in memory only: a restart just means signing in again.
+#[derive(Default)]
+pub struct PendingLogins {
+    map: Mutex<HashMap<String, PendingLogin>>,
+}
+
+struct PendingLogin {
+    user: String,
+    expires: Instant,
+    attempts: u32,
+}
+
+pub const PENDING_COOKIE: &str = "imsg_pending";
+pub const PENDING_TTL: Duration = Duration::from_secs(5 * 60);
+const PENDING_MAX_ATTEMPTS: u32 = 5;
+
+pub enum PendingCheck {
+    /// No such pending login (expired, used up or never existed).
+    Missing,
+    /// Known; the caller should verify the code for this user.
+    User(String),
+}
+
+impl PendingLogins {
+    /// Start a pending login and return its token (for the cookie).
+    pub fn start(&self, user: &str) -> String {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        let mut map = self.map.lock().unwrap();
+        map.retain(|_, p| p.expires > Instant::now());
+        map.insert(
+            token_hash(&token),
+            PendingLogin {
+                user: user.to_owned(),
+                expires: Instant::now() + PENDING_TTL,
+                attempts: 0,
+            },
+        );
+        token
+    }
+
+    /// Look up a pending login, counting this as an attempt. After too many
+    /// attempts it is discarded and the password must be entered again.
+    pub fn attempt(&self, token: &str) -> PendingCheck {
+        let key = token_hash(token);
+        let mut map = self.map.lock().unwrap();
+        let Some(p) = map.get_mut(&key) else {
+            return PendingCheck::Missing;
+        };
+        if p.expires <= Instant::now() || p.attempts >= PENDING_MAX_ATTEMPTS {
+            map.remove(&key);
+            return PendingCheck::Missing;
+        }
+        p.attempts += 1;
+        PendingCheck::User(p.user.clone())
+    }
+
+    pub fn finish(&self, token: &str) {
+        self.map.lock().unwrap().remove(&token_hash(token));
+    }
+}
+
+/// Extract a named 64-hex-digit token cookie from a `Cookie:` header value.
+pub fn named_cookie_token<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header
+        .split(';')
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+        .filter(|v| v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]
@@ -307,6 +388,35 @@ mod tests {
                 "[[account]]\nname = \"x\"\npassword = \"{h}\"\ndevice = [\"typo\"]\n"
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn totp_accounts_and_pending() {
+        let h = hash_password("pw").unwrap();
+        let secret = Secret::generate().to_base32();
+        let a = Accounts::parse(&format!(
+            "[[account]]\nname = \"a\"\npassword = \"{h}\"\ndevices = [\"*\"]\ntotp_secret = \"{secret}\"\n"
+        ))
+        .unwrap();
+        assert!(a.get("a").unwrap().totp.is_some());
+        assert!(Accounts::parse(&format!(
+            "[[account]]\nname = \"a\"\npassword = \"{h}\"\ndevices = [\"*\"]\ntotp_secret = \"!!\"\n"
+        ))
+        .is_err());
+
+        let p = PendingLogins::default();
+        let t = p.start("a");
+        for _ in 0..PENDING_MAX_ATTEMPTS {
+            assert!(matches!(p.attempt(&t), PendingCheck::User(u) if u == "a"));
+        }
+        assert!(matches!(p.attempt(&t), PendingCheck::Missing));
+        let t2 = p.start("a");
+        p.finish(&t2);
+        assert!(matches!(p.attempt(&t2), PendingCheck::Missing));
+        assert_eq!(
+            named_cookie_token(&format!("x=1; imsg_pending={t}"), PENDING_COOKIE),
+            Some(t.as_str())
         );
     }
 }

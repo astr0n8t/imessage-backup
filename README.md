@@ -148,6 +148,34 @@ To create an entry, run `hash-password`. It prompts for the password and prints 
 imsg-server hash-password --user alice >> accounts.toml
 ```
 
+### Two-factor authentication (TOTP)
+
+Any account can also require a 6-digit code from an authenticator app (1Password, Google Authenticator, Authy,
+Bitwarden, …):
+
+```sh
+imsg-server totp-secret --user alice
+```
+
+This shows a QR code to scan (use `--invert` on a light-background terminal; the key is also printed for
+manual entry). It then asks for a code from the app to confirm the setup and prints a line to add to that
+account's entry:
+
+```toml
+totp_secret = "QJ3ROH2XANMMT4OTTO2FJBTNJ7NCGA2M"
+```
+
+After a restart, that account signs in with password and then code. Details:
+
+* Codes are standard RFC 6238 (SHA-1, 30 s, 6 digits), and one step of clock drift either way is accepted. Keep
+  the server's clock in sync (NTP).
+* Each code works only once. After the password is accepted you have 5 minutes and 5 tries to enter a code, after which the password must be
+  entered again. Wrong codes count towards the per-IP lockout, and a correct password doesn't reset that count.
+* `--require-totp` (or `IMSG_REQUIRE_TOTP=1`) makes the server refuse to start while any account has no
+  `totp_secret`. Without it, accounts lacking a secret are listed in the startup log.
+* To reset someone's second factor, generate a new secret and replace the line. To turn it off, delete the line.
+* The secret is a shared key, so treat the accounts file like a password file (e.g. `chmod 600`).
+
 The older one-line `username:hash` file format is still accepted. Those users are admins who see everything.
 Restart the server after editing the accounts file. Removing an account ends its sessions immediately.
 
@@ -208,7 +236,7 @@ imsg-extract extract --out ~/imsg-staging --state ~/.config/imsg/state.json &&
 
 ## Security notes
 
-* Passwords are stored as argon2id hashes. Sessions are random 256-bit tokens; only their SHA-256 is stored.
+* Passwords are stored as argon2id hashes. Optional TOTP two-factor authentication is set per account. Sessions are random 256-bit tokens; only their SHA-256 is stored.
   Cookies are `HttpOnly` and `SameSite=Lax` (add `--secure-cookies` behind HTTPS).
 * After 10 failed logins from one IP address, logins from it are blocked for 15 minutes.
 * Account scoping is enforced on the server for every API call and attachment download. Attachments are served
