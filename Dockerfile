@@ -10,7 +10,7 @@ RUN apt-get update \
  && useradd --system --home /state imsg && mkdir -p /state && chown imsg /state
 COPY --from=build /src/target/release/imsg-server /usr/local/bin/imsg-server
 USER imsg
-ENV IMSG_DATA=/data IMSG_STATE_DIR=/state IMSG_AUTH_FILE=/users.txt IMSG_LISTEN=0.0.0.0:8080
+ENV IMSG_DATA=/data IMSG_STATE_DIR=/state IMSG_AUTH_FILE=/accounts.toml IMSG_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 ENTRYPOINT ["imsg-server"]
 CMD ["serve"]

@@ -103,16 +103,58 @@ Every `sms.db` is a normal Messages database, so `sqlite3` or any imessage-datab
 
 ## 3. Serve
 
-Create a password file (one `username:argon2-hash` line per user):
+### Accounts
 
-```sh
-imsg-server hash-password --user me >> users.txt
+One archive can hold several people's phones. Each login account is tied to the **devices** and/or
+**iMessage IDs** whose messages it may see. Accounts live in a TOML file:
+
+```toml
+[[account]]
+name = "alice"
+password = "$argon2id$v=19$..."            # from `imsg-server hash-password`
+devices = ["00008110-000A1B2C3D4E5F6A"]    # backups of these devices (UDIDs); "*" = every device
+imessage_ids = ["+15550109999", "alice@icloud.com"]   # her numbers / Apple IDs, on any device
+admin = true                               # admins can also switch to other accounts' views
+
+[[account]]
+name = "bob"
+password = "$argon2id$v=19$..."
+devices = ["00008030-001122334455667E"]
 ```
 
-Run the server:
+* **`devices`** grants everything in that device's backups. Use it for "this person's phone(s)".
+* **`imessage_ids`** grants every message sent or received *as* that phone number or Apple ID, from any
+  archived device (matched on the message's `destination_caller_id`, with phone numbers normalized). A new
+  phone with the same number is covered without editing the file. Older iOS versions sometimes leave this
+  field empty, especially for SMS, so `devices` is the more complete grant.
+* An account sees a message if either rule matches. When several visible devices hold the same message (an old
+  and a new phone), it's shown once.
+* Each device's data is kept separately, so archiving two people who text each other never mixes their copies:
+  the same iMessage has the same GUID on the sender's and recipient's phones. Conversation names, participants and
+  contact names also come only from devices the account can see.
+* An admin gets a **Viewing** picker in the sidebar to look at any account's view. Granting one account several
+  people's devices (`"*"`) works, but those people's threads with the same contact then appear as one
+  conversation, so prefer one account per person.
+
+To find device UDIDs and the iMessage IDs each device used:
 
 ```sh
-imsg-server serve --data ~/MessagesArchive --auth-file users.txt --listen 127.0.0.1:8080
+imsg-server identities --data ~/MessagesArchive     # also in the UI: ⓘ (admins)
+```
+
+To create an entry, run `hash-password`. It prompts for the password and prints an `[[account]]` block to fill in:
+
+```sh
+imsg-server hash-password --user alice >> accounts.toml
+```
+
+The older one-line `username:hash` file format is still accepted. Those users are admins who see everything.
+Restart the server after editing the accounts file. Removing an account ends its sessions immediately.
+
+### Run
+
+```sh
+imsg-server serve --data ~/MessagesArchive --accounts accounts.toml --listen 127.0.0.1:8080
 ```
 
 * The index, sessions and transcode cache go in `<data>/.imsg-server/`. Use `--state-dir` if the data folder is
@@ -121,7 +163,8 @@ imsg-server serve --data ~/MessagesArchive --auth-file users.txt --listen 127.0.
   snapshots** in the UI.
 * To reach it from outside your network, put a TLS reverse proxy (Caddy, nginx, Tailscale Serve, …) in front of it
   and add `--secure-cookies`. Add `--trust-forwarded-for` only if the proxy sets `X-Forwarded-For`.
-* Every option also has an environment variable (`IMSG_DATA`, `IMSG_AUTH_FILE`, `IMSG_LISTEN`, …); see
+* Every option also has an environment variable (`IMSG_DATA`, `IMSG_AUTH_FILE` for the accounts file,
+  `IMSG_LISTEN`, …); see
   `imsg-server serve --help`.
 
 ### Docker
@@ -129,7 +172,7 @@ imsg-server serve --data ~/MessagesArchive --auth-file users.txt --listen 127.0.
 ```sh
 docker build -t imsg-server .
 docker run -d -p 8080:8080 \
-  -v /srv/imsg/archive:/data:ro -v /srv/imsg/state:/state -v /srv/imsg/users.txt:/users.txt:ro \
+  -v /srv/imsg/archive:/data:ro -v /srv/imsg/state:/state -v /srv/imsg/accounts.toml:/accounts.toml:ro \
   imsg-server
 ```
 
@@ -139,8 +182,9 @@ ImageMagick; `sips` is used automatically on macOS) and `ffmpeg` for the same be
 
 ### What the viewer shows
 
-* Every conversation from every snapshot and device. A contact's iMessage and SMS threads are merged.
-* Names from your Contacts (the newest Contacts DB wins).
+* Every conversation from every snapshot of the devices / iMessage IDs your account is granted. A contact's
+  iMessage and SMS threads are merged.
+* Names from the Contacts of those devices (the most recently backed-up Contacts DB wins).
 * Text formatting, links and mentions; photos, videos, audio (with transcriptions) and other files.
 * Tapbacks and emoji reactions, threaded replies, edit history, unsent messages, message effects,
   link previews, and group events (renames, people added or removed).
@@ -167,6 +211,8 @@ imsg-extract extract --out ~/imsg-staging --state ~/.config/imsg/state.json &&
 * Passwords are stored as argon2id hashes. Sessions are random 256-bit tokens; only their SHA-256 is stored.
   Cookies are `HttpOnly` and `SameSite=Lax` (add `--secure-cookies` behind HTTPS).
 * After 10 failed logins from one IP address, logins from it are blocked for 15 minutes.
+* Account scoping is enforced on the server for every API call and attachment download. Attachments are served
+  only when a message the account can see references them. Non-admins can't use `?as=`.
 * The UI runs under a strict Content-Security-Policy and inserts all message content as text, never as HTML.
   Attachments are served with `nosniff` and a sandbox CSP; anything other than images, audio and video is
   always downloaded, never rendered.
@@ -178,6 +224,7 @@ imsg-extract extract --out ~/imsg-staging --state ~/.config/imsg/state.json &&
 cargo test --workspace
 # A synthetic backup to try the whole flow without a phone:
 cargo run -p imsg-core --example sample_backup -- /tmp/demo-backup/00008110-SAMPLE 1
+# (optional args: password or "-", and the phone's own number, to simulate several people's phones)
 cargo run -p imsg-extract -- extract --backup /tmp/demo-backup/00008110-SAMPLE --out /tmp/demo-archive
 ```
 

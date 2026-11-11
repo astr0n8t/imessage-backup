@@ -1,5 +1,6 @@
 //! HTTP routes.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -14,18 +15,20 @@ use axum::{Form, Json, Router};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::auth::{self, COOKIE, Throttle, Users};
+use crate::auth::{self, Accounts, COOKIE, Throttle};
 use crate::index::{Index, IngestReport};
 use crate::media::{self, ServeRequest, Tools};
 use crate::queries::{self, Cursor, Names};
+use crate::view::View;
 
 pub struct AppState {
     pub index: Index,
     pub data: PathBuf,
     pub cache: PathBuf,
-    pub users: Users,
+    pub accounts: Accounts,
     pub throttle: Throttle,
-    pub names: RwLock<Arc<Names>>,
+    /// Contact names per account view, rebuilt lazily after each ingest.
+    pub names: RwLock<HashMap<String, Arc<Names>>>,
     pub tools: Tools,
     pub secure_cookies: bool,
     pub trust_forwarded_for: bool,
@@ -37,21 +40,39 @@ pub struct AppState {
 type St = State<Arc<AppState>>;
 
 impl AppState {
-    pub fn names(&self) -> Arc<Names> {
-        self.names.read().unwrap().clone()
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        index: Index,
+        data: PathBuf,
+        cache: PathBuf,
+        accounts: Accounts,
+        tools: Tools,
+        secure_cookies: bool,
+        trust_forwarded_for: bool,
+        session_ttl: Duration,
+    ) -> Self {
+        Self {
+            index,
+            data,
+            cache,
+            accounts,
+            throttle: Throttle::default(),
+            names: RwLock::new(HashMap::new()),
+            tools,
+            secure_cookies,
+            trust_forwarded_for,
+            session_ttl,
+            ingest_lock: tokio::sync::Mutex::new(()),
+            last_ingest: RwLock::new(None),
+        }
     }
 
-    /// Ingest new snapshots (serialized) and refresh cached contact names.
+    /// Ingest new snapshots (serialized) and drop cached contact names.
     pub async fn ingest(self: &Arc<Self>) -> anyhow::Result<IngestReport> {
         let _guard = self.ingest_lock.lock().await;
         let me = self.clone();
-        let report = tokio::task::spawn_blocking(move || -> anyhow::Result<IngestReport> {
-            let r = me.index.ingest_all(&me.data)?;
-            let names = Names::load(&me.index.read()?)?;
-            *me.names.write().unwrap() = Arc::new(names);
-            Ok(r)
-        })
-        .await??;
+        let report = tokio::task::spawn_blocking(move || me.index.ingest_all(&me.data)).await??;
+        self.names.write().unwrap().clear();
         *self.last_ingest.write().unwrap() = Some((chrono::Utc::now(), report.clone()));
         Ok(report)
     }
@@ -86,23 +107,50 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Run a blocking closure with a read connection to the index.
-async fn with_db<T: Send + 'static>(
+/// Run a blocking closure with a plain connection to the index.
+async fn with_conn<T: Send + 'static>(
     st: &Arc<AppState>,
-    f: impl FnOnce(&rusqlite::Connection, &Names) -> anyhow::Result<T> + Send + 'static,
+    f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, AppError> {
     let st = st.clone();
+    Ok(tokio::task::spawn_blocking(move || f(&st.index.read()?)).await??)
+}
+
+/// Run a blocking closure with a connection restricted to the viewer's view.
+async fn with_view<T: Send + 'static>(
+    st: &Arc<AppState>,
+    viewer: &Viewer,
+    f: impl FnOnce(&rusqlite::Connection, &View, &Names) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, AppError> {
+    let st = st.clone();
+    let (key, view) = (viewer.viewing.clone(), viewer.view.clone());
     Ok(tokio::task::spawn_blocking(move || {
         let conn = st.index.read()?;
-        f(&conn, &st.names())
+        view.install(&conn)?;
+        let cached = st.names.read().unwrap().get(&key).cloned();
+        let names = match cached {
+            Some(n) => n,
+            None => {
+                let n = Arc::new(Names::load(&conn, &view)?);
+                st.names.write().unwrap().insert(key, n.clone());
+                n
+            }
+        };
+        f(&conn, &view, &names)
     })
     .await??)
 }
 
-/// The authenticated user, from the session cookie.
-pub struct User(#[allow(dead_code)] pub String);
+/// The signed-in account and the account whose data it is looking at
+/// (admins may pass `?as=<account>` to look at another account's view).
+pub struct Viewer {
+    pub account: String,
+    pub admin: bool,
+    pub viewing: String,
+    pub view: View,
+}
 
-impl FromRequestParts<Arc<AppState>> for User {
+impl FromRequestParts<Arc<AppState>> for Viewer {
     type Rejection = AppError;
 
     async fn from_request_parts(
@@ -119,11 +167,35 @@ impl FromRequestParts<Arc<AppState>> for User {
         let Some(token) = token else {
             return Err(AppError::Status(StatusCode::UNAUTHORIZED, "not signed in"));
         };
-        let user = with_db(st, move |c, _| auth::session_user(c, &token)).await?;
-        user.map(User).ok_or(AppError::Status(
-            StatusCode::UNAUTHORIZED,
-            "session expired",
-        ))
+        let user = with_conn(st, move |c| auth::session_user(c, &token)).await?;
+        // Accounts removed from the accounts file lose access immediately.
+        let Some(account) = user.and_then(|u| st.accounts.get(&u)) else {
+            return Err(AppError::Status(
+                StatusCode::UNAUTHORIZED,
+                "session expired",
+            ));
+        };
+        let wanted = parts.uri.query().and_then(|q| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "as")
+                .map(|(_, v)| v.to_owned())
+        });
+        let target = match wanted.as_deref() {
+            None | Some("") => account,
+            Some(name) if name == account.name => account,
+            Some(name) if account.admin => st
+                .accounts
+                .get(name)
+                .ok_or(AppError::Status(StatusCode::NOT_FOUND, "no such account"))?,
+            Some(_) => return Err(AppError::Status(StatusCode::FORBIDDEN, "admins only")),
+        };
+        Ok(Viewer {
+            account: account.name.clone(),
+            admin: account.admin,
+            viewing: target.name.clone(),
+            view: target.view.clone(),
+        })
     }
 }
 
@@ -167,6 +239,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }),
         )
         .route("/healthz", get(|| async { "ok" }))
+        .route("/api/me", get(api_me))
+        .route("/api/identities", get(api_identities))
         .route("/api/conversations", get(api_conversations))
         .route("/api/conversations/{id}", get(api_conversation))
         .route("/api/conversations/{id}/messages", get(api_messages))
@@ -184,7 +258,7 @@ fn no_store(mut r: Response) -> Response {
     r
 }
 
-async fn index_page(user: Result<User, AppError>) -> Response {
+async fn index_page(user: Result<Viewer, AppError>) -> Response {
     match user {
         Ok(_) => no_store(Html(INDEX_HTML).into_response()),
         Err(_) => Redirect::to("/login").into_response(),
@@ -244,7 +318,7 @@ async fn login(
     }
     let st2 = st.clone();
     let (user, pass) = (form.username.clone(), form.password);
-    let ok = tokio::task::spawn_blocking(move || st2.users.verify(&user, &pass)).await?;
+    let ok = tokio::task::spawn_blocking(move || st2.accounts.verify(&user, &pass)).await?;
     if !ok {
         st.throttle.fail(ip);
         warn!(%ip, user = %form.username, "failed login");
@@ -254,7 +328,7 @@ async fn login(
     st.throttle.succeed(ip);
     let ttl = st.session_ttl;
     let user = form.username.clone();
-    let token = with_db(&st, move |c, _| auth::create_session(c, &user, ttl)).await?;
+    let token = with_conn(&st, move |c| auth::create_session(c, &user, ttl)).await?;
     info!(%ip, user = %form.username, "signed in");
     let mut resp = Redirect::to("/").into_response();
     resp.headers_mut().insert(
@@ -271,7 +345,7 @@ async fn logout(State(st): St, headers: HeaderMap) -> Result<Response, AppError>
         .and_then(auth::cookie_token)
         .map(str::to_owned)
     {
-        with_db(&st, move |c, _| auth::delete_session(c, &token)).await?;
+        with_conn(&st, move |c| auth::delete_session(c, &token)).await?;
     }
     let mut resp = Redirect::to("/login").into_response();
     resp.headers_mut()
@@ -279,18 +353,51 @@ async fn logout(State(st): St, headers: HeaderMap) -> Result<Response, AppError>
     Ok(resp)
 }
 
-async fn api_conversations(_u: User, State(st): St) -> Result<Response, AppError> {
-    let v = with_db(&st, queries::conversations).await?;
-    Ok(no_store(Json(v).into_response()))
+async fn api_me(v: Viewer, State(st): St) -> Result<Response, AppError> {
+    let accounts: Vec<serde_json::Value> = if v.admin {
+        st.accounts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name, "admin": a.admin, "devices": a.devices, "imessage_ids": a.imessage_ids,
+                })
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    Ok(no_store(
+        Json(serde_json::json!({
+            "name": v.account, "admin": v.admin, "viewing": v.viewing, "accounts": accounts,
+        }))
+        .into_response(),
+    ))
+}
+
+async fn api_identities(v: Viewer, State(st): St) -> Result<Response, AppError> {
+    if !v.admin {
+        return Err(AppError::Status(StatusCode::FORBIDDEN, "admins only"));
+    }
+    let ids = with_conn(&st, queries::identities).await?;
+    Ok(no_store(Json(ids).into_response()))
+}
+
+async fn api_conversations(v: Viewer, State(st): St) -> Result<Response, AppError> {
+    let out = with_view(&st, &v, queries::conversations).await?;
+    Ok(no_store(Json(out).into_response()))
 }
 
 async fn api_conversation(
-    _u: User,
+    v: Viewer,
     State(st): St,
     UrlPath(id): UrlPath<i64>,
 ) -> Result<Response, AppError> {
-    match with_db(&st, move |c, n| queries::conversation(c, n, id)).await? {
-        Some(v) => Ok(no_store(Json(v).into_response())),
+    match with_view(&st, &v, move |c, view, n| {
+        queries::conversation(c, view, n, id)
+    })
+    .await?
+    {
+        Some(out) => Ok(no_store(Json(out).into_response())),
         None => Err(AppError::Status(
             StatusCode::NOT_FOUND,
             "no such conversation",
@@ -307,7 +414,7 @@ struct MessagesQuery {
 }
 
 async fn api_messages(
-    _u: User,
+    v: Viewer,
     State(st): St,
     UrlPath(id): UrlPath<i64>,
     Query(q): Query<MessagesQuery>,
@@ -319,8 +426,11 @@ async fn api_messages(
         _ => Cursor::Latest,
     };
     let limit = q.limit.unwrap_or(80);
-    let v = with_db(&st, move |c, n| queries::messages(c, n, id, cursor, limit)).await?;
-    Ok(no_store(Json(v).into_response()))
+    let out = with_view(&st, &v, move |c, view, n| {
+        queries::messages(c, view, n, id, cursor, limit)
+    })
+    .await?;
+    Ok(no_store(Json(out).into_response()))
 }
 
 #[derive(Deserialize)]
@@ -331,27 +441,27 @@ struct SearchQuery {
 }
 
 async fn api_search(
-    _u: User,
+    v: Viewer,
     State(st): St,
     Query(q): Query<SearchQuery>,
 ) -> Result<Response, AppError> {
-    let v = with_db(&st, move |c, n| {
-        queries::search(c, n, &q.q, q.conv, q.limit.unwrap_or(100))
+    let out = with_view(&st, &v, move |c, view, n| {
+        queries::search(c, view, n, &q.q, q.conv, q.limit.unwrap_or(100))
     })
     .await?;
-    Ok(no_store(Json(v).into_response()))
+    Ok(no_store(Json(out).into_response()))
 }
 
-async fn api_status(_u: User, State(st): St) -> Result<Response, AppError> {
-    let mut v = serde_json::to_value(with_db(&st, |c, _| queries::status(c)).await?)?;
+async fn api_status(v: Viewer, State(st): St) -> Result<Response, AppError> {
+    let mut out = serde_json::to_value(with_view(&st, &v, queries::status).await?)?;
     if let Some((at, r)) = st.last_ingest.read().unwrap().clone() {
-        v["last_scan"] = serde_json::json!({ "at": at, "report": r });
+        out["last_scan"] = serde_json::json!({ "at": at, "report": r });
     }
-    v["transcoding"] = st.tools.describe().into();
-    Ok(no_store(Json(v).into_response()))
+    out["transcoding"] = st.tools.describe().into();
+    Ok(no_store(Json(out).into_response()))
 }
 
-async fn api_rescan(_u: User, State(st): St) -> Result<Response, AppError> {
+async fn api_rescan(_v: Viewer, State(st): St) -> Result<Response, AppError> {
     let r = st.ingest().await?;
     Ok(no_store(Json(r).into_response()))
 }
@@ -363,7 +473,7 @@ struct MediaQuery {
 }
 
 async fn media_file(
-    _u: User,
+    v: Viewer,
     State(st): St,
     UrlPath(file_id): UrlPath<String>,
     Query(q): Query<MediaQuery>,
@@ -376,7 +486,10 @@ async fn media_file(
         ));
     }
     let fid = file_id.clone();
-    let rows = with_db(&st, move |c, _| queries::attachment(c, &fid)).await?;
+    let rows = with_view(&st, &v, move |c, view, _| {
+        queries::attachment(c, view, &fid)
+    })
+    .await?;
     // The same file may exist under several devices; use the first one present.
     let found = rows.into_iter().find_map(|(device, mime, name)| {
         let p = imsg_core::archive::attachment_path(

@@ -1,4 +1,7 @@
 //! Read-side queries backing the JSON API.
+//!
+//! Every query is restricted to a [`View`]; call [`View::install`] on the
+//! connection first (the web layer does this for each request).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -8,13 +11,28 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::Serialize;
 use serde_json::value::RawValue;
 
+use crate::view::View;
+
 /// Contact names keyed by [`handle_key`].
 #[derive(Default, Clone)]
 pub struct Names(pub HashMap<String, String>);
 
 impl Names {
-    pub fn load(conn: &Connection) -> Result<Self> {
-        let mut stmt = conn.prepare("SELECT key, name FROM contacts")?;
+    /// Names from the Contacts DBs of the devices this view can see. When
+    /// devices disagree, the most recently backed-up Contacts DB wins.
+    pub fn load(conn: &Connection, view: &View) -> Result<Self> {
+        let sql = format!(
+            "SELECT c.key, c.name FROM contacts c JOIN contact_sources s ON s.device = c.device
+             WHERE {} OR c.device IN (SELECT DISTINCT a.device FROM conv_stats a WHERE {})
+             ORDER BY s.snap_order",
+            if view.all {
+                "1".to_owned()
+            } else {
+                "c.device IN (SELECT d FROM temp.v_dev)".to_owned()
+            },
+            view.filter("a"),
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let map = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<Result<_, _>>()?;
@@ -97,13 +115,57 @@ fn title_for(
     }
 }
 
-fn participants_of(conn: &Connection, conv: i64, names: &Names) -> Result<Vec<Participant>> {
-    let mut stmt =
-        conn.prepare_cached("SELECT handle FROM participants WHERE conv_id = ?1 ORDER BY handle")?;
+/// Devices whose copy of this conversation the view can see.
+fn visible_devices_sql(view: &View) -> String {
+    format!(
+        "(SELECT a.device FROM conv_stats a WHERE a.conv_id = ?1 AND {})",
+        view.filter("a")
+    )
+}
+
+/// Build one conversation summary. `count` is the exact (de-duplicated)
+/// message count when requested, otherwise `approx_count`.
+fn conversation_out(
+    conn: &Connection,
+    view: &View,
+    names: &Names,
+    id: i64,
+    last_ms: Option<i64>,
+    approx_count: i64,
+    exact: bool,
+) -> Result<ConversationOut> {
+    let devices = visible_devices_sql(view);
+    let key: String = conn.query_row("SELECT key FROM conversations WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })?;
+    let (display_name, is_group, services): (Option<String>, bool, String) = conn
+        .query_row(
+            &format!(
+                "SELECT (SELECT display_name FROM conv_meta WHERE conv_id = ?1 AND device IN {devices}
+                            AND display_name IS NOT NULL ORDER BY snap_order DESC LIMIT 1),
+                        coalesce(max(is_group), 0), coalesce(group_concat(services, ','), '')
+                 FROM conv_meta WHERE conv_id = ?1 AND device IN {devices}"
+            ),
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .unwrap_or((None, false, String::new()));
+    let mut services: Vec<String> = services
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    services.sort();
+    services.dedup();
+
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT DISTINCT handle FROM participants WHERE conv_id = ?1 AND device IN {devices} ORDER BY handle"
+    ))?;
     let handles: Vec<String> = stmt
-        .query_map([conv], |r| r.get(0))?
+        .query_map([id], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
-    let mut out: Vec<Participant> = handles
+    let mut participants: Vec<Participant> = handles
         .into_iter()
         .map(|h| Participant {
             name: names.display(&h),
@@ -112,54 +174,104 @@ fn participants_of(conn: &Connection, conv: i64, names: &Names) -> Result<Vec<Pa
         })
         .collect();
     // The same person can appear under several handles (phone + email).
-    out.sort_by_key(|a| a.name.to_lowercase());
-    out.dedup_by(|a, b| a.known && b.known && a.name == b.name);
-    Ok(out)
-}
+    participants.sort_by_key(|p| p.name.to_lowercase());
+    participants.dedup_by(|a, b| a.known && b.known && a.name == b.name);
 
-fn conversation_from_row(conn: &Connection, r: &Row, names: &Names) -> Result<ConversationOut> {
-    let id: i64 = r.get("id")?;
-    let key: String = r.get("key")?;
-    let participants = participants_of(conn, id, names)?;
-    let services: Option<String> = r.get("services")?;
+    let vis = view.filter("m");
+    let last: Option<(String, String, String, bool, Option<String>)> = conn
+        .query_row(
+            &format!(
+                "SELECT coalesce(m.text, ''), m.kind, m.body, m.is_from_me, m.sender FROM messages m
+                 WHERE m.conv_id = ?1 AND m.kind IN ('message', 'announcement') AND {vis}
+                 ORDER BY m.date_ms DESC, m.id DESC LIMIT 1"
+            ),
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let (last_preview, last_from_me, last_sender) = match last {
+        Some((text, kind, body, from_me, sender)) => {
+            let preview = if !text.is_empty() {
+                text
+            } else if kind == "announcement" {
+                "(group update)".into()
+            } else if body.contains(r#""t":"attachment""#) {
+                "📎 Attachment".into()
+            } else {
+                String::new()
+            };
+            (Some(preview), from_me, sender.map(|s| names.display(&s)))
+        }
+        None => (None, false, None),
+    };
+    let msg_count = if exact {
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM messages m WHERE m.conv_id = ?1 AND m.kind = 'message' AND {vis} AND {}",
+                view.dedupe("m")
+            ),
+            [id],
+            |r| r.get(0),
+        )?
+    } else {
+        approx_count
+    };
     Ok(ConversationOut {
         id,
-        title: title_for(r.get("display_name")?, &participants, &key, names),
-        is_group: r.get("is_group")?,
-        services: services
-            .unwrap_or_default()
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect(),
-        last_ms: r.get("last_ms")?,
-        last_preview: r.get("last_preview")?,
-        last_from_me: r.get::<_, Option<bool>>("last_from_me")?.unwrap_or(false),
-        last_sender: r
-            .get::<_, Option<String>>("last_sender")?
-            .map(|h| names.display(&h)),
-        msg_count: r.get("msg_count")?,
+        title: title_for(display_name, &participants, &key, names),
+        is_group,
         participants,
+        services,
+        last_ms,
+        last_preview,
+        last_from_me,
+        last_sender,
+        msg_count,
     })
 }
 
-pub fn conversations(conn: &Connection, names: &Names) -> Result<Vec<ConversationOut>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM conversations WHERE msg_count > 0 OR last_ms IS NOT NULL ORDER BY last_ms DESC NULLS LAST",
-    )?;
-    let mut rows = stmt.query([])?;
-    let mut out = Vec::new();
-    while let Some(r) = rows.next()? {
-        out.push(conversation_from_row(conn, r, names)?);
-    }
-    Ok(out)
+/// Conversations with at least one visible message, most recent first.
+/// `msg_count` here is approximate (copies on several devices count twice).
+pub fn conversations(
+    conn: &Connection,
+    view: &View,
+    names: &Names,
+) -> Result<Vec<ConversationOut>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT a.conv_id, max(a.last_ms), sum(a.msg_count) FROM conv_stats a WHERE {}
+         GROUP BY a.conv_id ORDER BY max(a.last_ms) DESC",
+        view.filter("a")
+    ))?;
+    let rows: Vec<(i64, Option<i64>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter()
+        .map(|(id, last, count)| conversation_out(conn, view, names, id, last, count, false))
+        .collect()
 }
 
-pub fn conversation(conn: &Connection, names: &Names, id: i64) -> Result<Option<ConversationOut>> {
-    let mut stmt = conn.prepare("SELECT * FROM conversations WHERE id = ?1")?;
-    let mut rows = stmt.query([id])?;
-    match rows.next()? {
-        Some(r) => Ok(Some(conversation_from_row(conn, r, names)?)),
+/// One conversation, if the view can see any of it.
+pub fn conversation(
+    conn: &Connection,
+    view: &View,
+    names: &Names,
+    id: i64,
+) -> Result<Option<ConversationOut>> {
+    let last: Option<(Option<i64>, i64)> = conn
+        .query_row(
+            &format!(
+                "SELECT max(a.last_ms), sum(a.msg_count) FROM conv_stats a WHERE a.conv_id = ?1 AND {}
+                 HAVING count(*) > 0",
+                view.filter("a")
+            ),
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match last {
+        Some((last, count)) => Ok(Some(conversation_out(
+            conn, view, names, id, last, count, true,
+        )?)),
         None => Ok(None),
     }
 }
@@ -221,7 +333,8 @@ type ReactionEvent = (String, i64, bool, Option<String>, bool);
 /// `(device, mime, name)` of an archived attachment.
 pub type AttachmentLocation = (String, Option<String>, Option<String>);
 
-const COLS: &str = "id, guid, is_from_me, sender, date_ms, read_ms, delivered_ms, edited_ms, service, kind, body, expressive, thread_guid";
+const COLS: &str = "m.id, m.guid, m.is_from_me, m.sender, m.date_ms, m.read_ms, m.delivered_ms, m.edited_ms, \
+                    m.service, m.kind, m.body, m.expressive, m.thread_guid";
 
 struct RawMsg {
     out: MessageOut,
@@ -255,8 +368,10 @@ fn raw_from_row(r: &Row, names: &Names) -> rusqlite::Result<RawMsg> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch(
     conn: &Connection,
+    view: &View,
     names: &Names,
     conv: i64,
     cmp: &str,
@@ -266,13 +381,16 @@ fn fetch(
 ) -> Result<Vec<RawMsg>> {
     let order = if desc { "DESC" } else { "ASC" };
     let pivot_clause = if pivot.is_some() {
-        format!("AND (date_ms, id) {cmp} (SELECT date_ms, id FROM messages WHERE id = ?3)")
+        format!("AND (m.date_ms, m.id) {cmp} (SELECT date_ms, id FROM messages WHERE id = ?3)")
     } else {
         String::new()
     };
     let sql = format!(
-        "SELECT {COLS} FROM messages WHERE conv_id = ?1 AND kind IN ('message', 'announcement') {pivot_clause}
-         ORDER BY date_ms {order}, id {order} LIMIT ?2"
+        "SELECT {COLS} FROM messages m WHERE m.conv_id = ?1 AND m.kind IN ('message', 'announcement')
+           AND {} AND {} {pivot_clause}
+         ORDER BY m.date_ms {order}, m.id {order} LIMIT ?2",
+        view.filter("m"),
+        view.dedupe("m"),
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = match pivot {
@@ -286,37 +404,64 @@ fn fetch(
     Ok(rows)
 }
 
+/// Is message `id` visible to `view`?
+pub fn message_visible(conn: &Connection, view: &View, id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT 1 FROM messages m WHERE m.id = ?1 AND {}",
+                view.filter("m")
+            ),
+            [id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 pub fn messages(
     conn: &Connection,
+    view: &View,
     names: &Names,
     conv: i64,
     cursor: Cursor,
     limit: i64,
 ) -> Result<Page> {
     let limit = limit.clamp(1, 500);
+    // A pivot message from outside the view would leak its position.
+    if let Cursor::Before(p) | Cursor::After(p) | Cursor::Around(p) = cursor
+        && !message_visible(conn, view, p)?
+    {
+        return Ok(Page {
+            messages: vec![],
+            has_more_before: false,
+            has_more_after: false,
+            names: BTreeMap::new(),
+        });
+    }
     let (mut before, mut after, more_before, more_after) = match cursor {
         Cursor::Latest => {
-            let mut v = fetch(conn, names, conv, "", None, true, limit + 1)?;
+            let mut v = fetch(conn, view, names, conv, "", None, true, limit + 1)?;
             let more = v.len() as i64 > limit;
             v.truncate(limit as usize);
             (v, vec![], more, false)
         }
         Cursor::Before(id) => {
-            let mut v = fetch(conn, names, conv, "<", Some(id), true, limit + 1)?;
+            let mut v = fetch(conn, view, names, conv, "<", Some(id), true, limit + 1)?;
             let more = v.len() as i64 > limit;
             v.truncate(limit as usize);
             (v, vec![], more, true)
         }
         Cursor::After(id) => {
-            let mut v = fetch(conn, names, conv, ">", Some(id), false, limit + 1)?;
+            let mut v = fetch(conn, view, names, conv, ">", Some(id), false, limit + 1)?;
             let more = v.len() as i64 > limit;
             v.truncate(limit as usize);
             (vec![], v, true, more)
         }
         Cursor::Around(id) => {
             let half = (limit / 2).max(1);
-            let mut b = fetch(conn, names, conv, "<=", Some(id), true, half + 1)?;
-            let mut a = fetch(conn, names, conv, ">", Some(id), false, half + 1)?;
+            let mut b = fetch(conn, view, names, conv, "<=", Some(id), true, half + 1)?;
+            let mut a = fetch(conn, view, names, conv, ">", Some(id), false, half + 1)?;
             let mb = b.len() as i64 > half;
             let ma = a.len() as i64 > half;
             b.truncate(half as usize);
@@ -327,6 +472,7 @@ pub fn messages(
     before.reverse();
     before.append(&mut after);
     let mut raws = before;
+    let vis = view.filter("m");
 
     // Reactions, replies and reply counts for the page.
     if !raws.is_empty() {
@@ -335,8 +481,9 @@ pub fn messages(
         let mut reactions: HashMap<String, Vec<ReactionEvent>> = HashMap::new();
         {
             let mut stmt = conn.prepare(&format!(
-                "SELECT assoc_guid, coalesce(assoc_part, 0), is_from_me, sender, reaction, reaction_removed
-                 FROM messages WHERE kind = 'reaction' AND assoc_guid IN ({placeholders}) ORDER BY date_ms, id"
+                "SELECT m.assoc_guid, coalesce(m.assoc_part, 0), m.is_from_me, m.sender, m.reaction, m.reaction_removed
+                 FROM messages m WHERE m.kind = 'reaction' AND m.assoc_guid IN ({placeholders}) AND {vis}
+                 ORDER BY m.date_ms, m.id"
             ))?;
             let mut rows = stmt.query(params_from_iter(guids.iter()))?;
             while let Some(r) = rows.next()? {
@@ -354,18 +501,22 @@ pub fn messages(
         let mut reply_counts: HashMap<String, i64> = HashMap::new();
         {
             let mut stmt = conn.prepare(&format!(
-                "SELECT thread_guid, count(*) FROM messages WHERE thread_guid IN ({placeholders}) GROUP BY thread_guid"
+                "SELECT m.thread_guid, count(DISTINCT m.guid) FROM messages m
+                 WHERE m.thread_guid IN ({placeholders}) AND {vis} GROUP BY m.thread_guid"
             ))?;
             let mut rows = stmt.query(params_from_iter(guids.iter()))?;
             while let Some(r) = rows.next()? {
                 reply_counts.insert(r.get(0)?, r.get(1)?);
             }
         }
-        let mut origin = conn
-            .prepare_cached("SELECT id, is_from_me, sender, text FROM messages WHERE guid = ?1")?;
+        let mut origin = conn.prepare_cached(&format!(
+            "SELECT m.id, m.is_from_me, m.sender, m.text FROM messages m WHERE m.guid = ?1 AND {vis}
+             ORDER BY m.snap_order DESC LIMIT 1"
+        ))?;
         for m in &mut raws {
             if let Some(list) = reactions.remove(&m.out.guid) {
-                // Replay add/remove events per (sender, part, emoji).
+                // Replay add/remove events per (sender, part, emoji). Copies from
+                // several devices collapse because their keys are equal.
                 let mut state: Vec<(String, i64, bool, Option<String>)> = Vec::new();
                 for (emoji, part, from_me, sender, removed) in list {
                     let key = (emoji.clone(), part, from_me, sender.clone());
@@ -454,6 +605,7 @@ pub fn fts_query(q: &str) -> Option<String> {
 
 pub fn search(
     conn: &Connection,
+    view: &View,
     names: &Names,
     q: &str,
     conv: Option<i64>,
@@ -462,13 +614,15 @@ pub fn search(
     let Some(fq) = fts_query(q) else {
         return Ok(vec![]);
     };
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT m.id, m.conv_id, m.date_ms, m.is_from_me, m.sender,
                 snippet(messages_fts, 0, char(2), char(3), '…', 16)
          FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid
-         WHERE messages_fts MATCH ?1 AND (?2 IS NULL OR m.conv_id = ?2)
+         WHERE messages_fts MATCH ?1 AND (?2 IS NULL OR m.conv_id = ?2) AND {} AND {}
          ORDER BY m.date_ms DESC LIMIT ?3",
-    )?;
+        view.filter("m"),
+        view.dedupe("m"),
+    ))?;
     let rows: Vec<(i64, i64, i64, bool, Option<String>, String)> = stmt
         .query_map(params![fq, conv, limit.clamp(1, 500)], |r| {
             Ok((
@@ -485,7 +639,7 @@ pub fn search(
     let mut out = Vec::with_capacity(rows.len());
     for (id, conv_id, date_ms, from_me, sender, snippet) in rows {
         if !titles.contains_key(&conv_id)
-            && let Some(c) = conversation(conn, names, conv_id)?
+            && let Some(c) = conversation(conn, view, names, conv_id)?
         {
             titles.insert(conv_id, c.title);
         }
@@ -513,41 +667,105 @@ pub struct Status {
 #[derive(Serialize)]
 pub struct SnapshotStatus {
     pub device: String,
+    pub device_name: Option<String>,
     pub snapshot_id: String,
     pub backup_ms: Option<i64>,
     pub ingested_ms: i64,
     pub messages: i64,
 }
 
-pub fn status(conn: &Connection) -> Result<Status> {
-    let mut stmt = conn.prepare(
-        "SELECT device, snapshot_id, backup_ms, ingested_ms, messages FROM snapshots ORDER BY backup_ms DESC",
-    )?;
+/// Snapshots of the devices the view can see, with totals.
+pub fn status(conn: &Connection, view: &View, names: &Names) -> Result<Status> {
+    let mut stmt =
+        conn.prepare(&format!(
+        "SELECT device, device_name, snapshot_id, backup_ms, ingested_ms, messages FROM snapshots s
+         WHERE {} OR s.device IN (SELECT DISTINCT a.device FROM conv_stats a WHERE {})
+         ORDER BY backup_ms DESC",
+        if view.all { "1".to_owned() } else { "s.device IN (SELECT d FROM temp.v_dev)".to_owned() },
+        view.filter("a"),
+    ))?;
     let snapshots = stmt
         .query_map([], |r| {
             Ok(SnapshotStatus {
                 device: r.get(0)?,
-                snapshot_id: r.get(1)?,
-                backup_ms: r.get(2)?,
-                ingested_ms: r.get(3)?,
-                messages: r.get(4)?,
+                device_name: r.get(1)?,
+                snapshot_id: r.get(2)?,
+                backup_ms: r.get(3)?,
+                ingested_ms: r.get(4)?,
+                messages: r.get(5)?,
             })
         })?
         .collect::<Result<_, _>>()?;
-    let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0));
+    let count = |sql: String| conn.query_row(&sql, [], |r| r.get::<_, i64>(0));
     Ok(Status {
         snapshots,
-        conversations: count("SELECT count(*) FROM conversations WHERE msg_count > 0")?,
-        messages: count("SELECT count(*) FROM messages WHERE kind = 'message'")?,
-        contacts: count("SELECT count(*) FROM contacts")?,
+        conversations: count(format!(
+            "SELECT count(DISTINCT a.conv_id) FROM conv_stats a WHERE {}",
+            view.filter("a")
+        ))?,
+        messages: count(format!(
+            "SELECT count(*) FROM messages m WHERE m.kind = 'message' AND {} AND {}",
+            view.filter("m"),
+            view.dedupe("m")
+        ))?,
+        contacts: names.0.len() as i64,
     })
 }
 
-/// Where an attachment lives: `(device, mime, name)`.
-pub fn attachment(conn: &Connection, file_id: &str) -> Result<Vec<AttachmentLocation>> {
-    let mut stmt =
-        conn.prepare_cached("SELECT device, mime, name FROM attachments WHERE file_id = ?1")?;
+/// Where an attachment lives, restricted to copies referenced by messages the
+/// view can see: `(device, mime, name)`.
+pub fn attachment(
+    conn: &Connection,
+    view: &View,
+    file_id: &str,
+) -> Result<Vec<AttachmentLocation>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT DISTINCT a.device, a.mime, a.name FROM message_files f
+         JOIN messages m ON m.id = f.message_id
+         JOIN attachments a ON a.file_id = f.file_id AND a.device = m.device
+         WHERE f.file_id = ?1 AND {}",
+        view.filter("m")
+    ))?;
     Ok(stmt
         .query_map([file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?)
+}
+
+/// A device and the iMessage IDs / numbers its messages used: what an admin
+/// needs to write the accounts file.
+#[derive(Serialize, Debug)]
+pub struct Identity {
+    pub device: String,
+    pub device_name: Option<String>,
+    pub last_backup_ms: Option<i64>,
+    /// `(normalized iMessage ID, message count)`; an empty ID means unknown.
+    pub imessage_ids: Vec<(String, i64)>,
+}
+
+pub fn identities(conn: &Connection) -> Result<Vec<Identity>> {
+    let mut stmt = conn.prepare(
+        "SELECT device, (SELECT device_name FROM snapshots s2 WHERE s2.device = s.device AND device_name IS NOT NULL
+                          ORDER BY backup_ms DESC LIMIT 1), max(backup_ms)
+         FROM snapshots s GROUP BY device ORDER BY max(backup_ms) DESC",
+    )?;
+    let devices: Vec<(String, Option<String>, Option<i64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut ids = conn.prepare(
+        "SELECT owner, sum(msg_count) FROM conv_stats WHERE device = ?1 GROUP BY owner ORDER BY sum(msg_count) DESC",
+    )?;
+    devices
+        .into_iter()
+        .map(|(device, device_name, last_backup_ms)| {
+            let imessage_ids = ids
+                .query_map([&device], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            Ok(Identity {
+                device,
+                device_name,
+                last_backup_ms,
+                imessage_ids,
+            })
+        })
+        .collect()
 }

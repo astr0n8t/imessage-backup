@@ -66,20 +66,29 @@ pub fn apple_ns(unix_secs: i64) -> i64 {
     (unix_secs - 978_307_200) * 1_000_000_000
 }
 
+/// The sample phone's own number (its iMessage ID) unless told otherwise.
+pub const SAMPLE_OWNER: &str = "+15550109999";
+
 pub struct SmsFixture {
     pub conn: Connection,
+    /// Written to `destination_caller_id`: the local account a message used.
+    pub owner: String,
 }
 
 impl SmsFixture {
     pub fn create(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            owner: SAMPLE_OWNER.into(),
+        })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             conn: Connection::open(path)?,
+            owner: SAMPLE_OWNER.into(),
         })
     }
 
@@ -124,9 +133,10 @@ impl SmsFixture {
         text: &str,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO message (guid, text, handle_id, service, date, date_read, date_delivered, is_from_me, is_read)
-             VALUES (?1, ?2, ?3, 'iMessage', ?4, 0, 0, ?5, 1)",
-            params![guid, text, handle, apple_ns(unix), from_me],
+            "INSERT INTO message (guid, text, handle_id, service, date, date_read, date_delivered, is_from_me, is_read,
+                destination_caller_id)
+             VALUES (?1, ?2, ?3, 'iMessage', ?4, 0, 0, ?5, 1, ?6)",
+            params![guid, text, handle, apple_ns(unix), from_me, self.owner],
         )?;
         let id = self.conn.last_insert_rowid();
         self.conn.execute(
@@ -194,11 +204,26 @@ pub fn build_sample_backup(
     stage: u8,
     backup_date: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
+    build_sample_backup_for(root, udid, password, stage, backup_date, SAMPLE_OWNER)
+}
+
+/// Like [`build_sample_backup`], for a phone whose own number is `owner`.
+/// (Message GUIDs are the same for every owner, just as an iMessage has the
+/// same GUID on the sender's and the recipient's phones.)
+pub fn build_sample_backup_for(
+    root: &Path,
+    udid: &str,
+    password: Option<&str>,
+    stage: u8,
+    backup_date: chrono::DateTime<chrono::Utc>,
+    owner: &str,
+) -> Result<()> {
     use crate::backup::fixture::FixtureBackup;
 
     let work = tempfile::tempdir()?;
     let sms_path = work.path().join("sms.db");
-    let f = SmsFixture::create(&sms_path)?;
+    let mut f = SmsFixture::create(&sms_path)?;
+    f.owner = owner.to_owned();
     let jane = f.handle("+15550100000", "iMessage")?;
     let bob = f.handle("+15550100001", "iMessage")?;
     let dm = f.chat("+15550100000", "iMessage", None, &[jane])?;
@@ -227,6 +252,19 @@ pub fn build_sample_backup(
         "image/png",
         10,
     )?;
+    if owner != SAMPLE_OWNER {
+        // Something only this phone has, to tell owners apart in tests.
+        let digits: String = owner.chars().filter(char::is_ascii_digit).collect();
+        let tag = &digits[digits.len().saturating_sub(4)..];
+        f.message(
+            dm,
+            &guid(&format!("OWN{tag}")),
+            jane,
+            true,
+            t + 300,
+            &format!("Only on the {tag} phone"),
+        )?;
+    }
     if stage >= 2 {
         f.message(
             dm,

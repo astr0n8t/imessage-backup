@@ -1,14 +1,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use imsg_server::auth::{Throttle, Users, hash_password};
+use imsg_server::auth::{Accounts, hash_password};
 use imsg_server::index::Index;
 use imsg_server::media::Tools;
-use imsg_server::queries::Names;
 use imsg_server::web::{AppState, router};
 use tracing::{info, warn};
 
@@ -47,8 +46,9 @@ enum Command {
         /// Address to listen on. Put a TLS reverse proxy in front for remote access.
         #[arg(short, long, env = "IMSG_LISTEN", default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
-        /// File of `username:argon2hash` lines (create with `imsg-server hash-password`).
-        #[arg(long, env = "IMSG_AUTH_FILE")]
+        /// Accounts file (TOML `[[account]]` entries; see README). The older
+        /// `username:argon2hash` line format is also accepted.
+        #[arg(long, visible_alias = "accounts", env = "IMSG_AUTH_FILE")]
         auth_file: PathBuf,
         /// Seconds between scans of the data folder for new snapshots (0 disables).
         #[arg(long, env = "IMSG_SCAN_INTERVAL", default_value_t = 300)]
@@ -68,14 +68,23 @@ enum Command {
         #[command(flatten)]
         paths: Paths,
     },
-    /// Hash a password and print an auth-file line.
+    /// List each archived device and the iMessage IDs / numbers its messages
+    /// used (ingesting new snapshots first), to help write the accounts file.
+    Identities {
+        #[command(flatten)]
+        paths: Paths,
+    },
+    /// Hash a password and print an `[[account]]` entry for the accounts file.
     HashPassword {
-        /// Username for the printed line.
+        /// Account name.
         #[arg(short, long, default_value = "admin")]
         user: String,
         /// Read the password from the first line of stdin instead of prompting.
         #[arg(long)]
         stdin: bool,
+        /// Print a legacy `name:hash` line instead (full access, admin).
+        #[arg(long)]
+        line: bool,
     },
 }
 
@@ -87,9 +96,14 @@ async fn main() -> Result<()> {
         )
         .init();
     match Cli::parse().command {
-        Command::HashPassword { user, stdin } => {
-            if user.contains(':') {
-                bail!("usernames cannot contain ':'");
+        Command::HashPassword { user, stdin, line } => {
+            if user.is_empty()
+                || user.contains([':', '"', '\\'])
+                || user.contains(char::is_whitespace)
+            {
+                bail!(
+                    "account names cannot be empty or contain spaces, quotes, backslashes or ':'"
+                );
             }
             let p1 = if stdin {
                 let mut line = String::new();
@@ -105,7 +119,46 @@ async fn main() -> Result<()> {
             if p1.len() < 8 {
                 bail!("use at least 8 characters");
             }
-            println!("{user}:{}", hash_password(&p1)?);
+            let hash = hash_password(&p1)?;
+            if line {
+                println!("{user}:{hash}");
+            } else {
+                println!(
+                    "[[account]]\nname = \"{user}\"\npassword = \"{hash}\"\n\
+                     # Device UDIDs whose backups this account sees (\"*\" = all); see `imsg-server identities`.\n\
+                     devices = []\n\
+                     # This person's phone numbers / Apple IDs; their messages from any device are visible.\n\
+                     imessage_ids = []\n\
+                     admin = false\n"
+                );
+            }
+        }
+        Command::Identities { paths } => {
+            let index = Index::open(&paths.state_dir().join("index.sqlite"))?;
+            let data = paths.data.clone();
+            let ids = tokio::task::spawn_blocking(move || -> Result<_> {
+                index.ingest_all(&data)?;
+                imsg_server::queries::identities(&index.read()?)
+            })
+            .await??;
+            if ids.is_empty() {
+                println!("No devices ingested yet.");
+            }
+            for d in ids {
+                println!(
+                    "{}  {}",
+                    d.device,
+                    d.device_name.as_deref().unwrap_or("(unnamed device)")
+                );
+                for (id, n) in d.imessage_ids {
+                    let id = if id.is_empty() {
+                        "(unknown)".to_owned()
+                    } else {
+                        id
+                    };
+                    println!("    {id:<36} {n} messages");
+                }
+            }
         }
         Command::Ingest { paths } => {
             let index = Index::open(&paths.state_dir().join("index.sqlite"))?;
@@ -122,10 +175,10 @@ async fn main() -> Result<()> {
             trust_forwarded_for,
             session_days,
         } => {
-            let users = Users::load(&auth_file)?;
-            if users.is_empty() {
+            let accounts = Accounts::load(&auth_file)?;
+            if accounts.is_empty() {
                 bail!(
-                    "{} contains no users; add one with `imsg-server hash-password`",
+                    "{} contains no accounts; add one with `imsg-server hash-password`",
                     auth_file.display()
                 );
             }
@@ -134,23 +187,18 @@ async fn main() -> Result<()> {
             }
             let state_dir = paths.state_dir();
             let index = Index::open(&state_dir.join("index.sqlite")).context("opening index")?;
-            let names = Names::load(&index.read()?)?;
             let tools = Tools::detect();
-            info!(users = users.len(), transcoding = %tools.describe(), "starting");
-            let state = Arc::new(AppState {
+            info!(accounts = accounts.len(), transcoding = %tools.describe(), "starting");
+            let state = Arc::new(AppState::new(
                 index,
-                data: paths.data.clone(),
-                cache: state_dir.join("cache"),
-                users,
-                throttle: Throttle::default(),
-                names: RwLock::new(Arc::new(names)),
+                paths.data.clone(),
+                state_dir.join("cache"),
+                accounts,
                 tools,
                 secure_cookies,
                 trust_forwarded_for,
-                session_ttl: Duration::from_secs(session_days * 86_400),
-                ingest_lock: tokio::sync::Mutex::new(()),
-                last_ingest: RwLock::new(None),
-            });
+                Duration::from_secs(session_days * 86_400),
+            ));
 
             let scanner = state.clone();
             tokio::spawn(async move {

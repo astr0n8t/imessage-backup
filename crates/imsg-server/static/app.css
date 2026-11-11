@@ -57,6 +57,11 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .side-head h1 { font-size: 20px; margin: 0; }
 .side-actions { display: flex; gap: 2px; align-items: center; }
 .side-actions form { margin: 0; }
+.view-wrap { display: flex; align-items: center; gap: 8px; padding: 0 14px 4px; font-size: 13px; color: var(--muted); }
+.view-wrap[hidden] { display: none; }
+#view-select { flex: 1; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
+#status-body h3 { font-size: 14px; margin: 14px 0 4px; }
+#status-body code { font-size: 12px; }
 .search-wrap { padding: 6px 14px 10px; }
 #search { width: 100%; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
 #conv-list, #search-results { overflow-y: auto; flex: 1; }
