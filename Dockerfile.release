@@ -1,0 +1,19 @@
+# Image used by the release workflow (.github/workflows/release.yml).
+#
+# Unlike ./Dockerfile it does not compile anything: it packages the static
+# (musl) imsg-server binaries the workflow already built for each platform,
+# which keeps multi-arch builds fast (no Rust compilation under emulation).
+# The build context must contain bin/<arch>/imsg-server (arch = amd64, arm64).
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libheif-examples ffmpeg ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --home /state imsg && mkdir -p /state && chown imsg /state
+COPY --chmod=755 bin/${TARGETARCH}/imsg-server /usr/local/bin/imsg-server
+USER imsg
+ENV IMSG_DATA=/data IMSG_STATE_DIR=/state IMSG_AUTH_FILE=/accounts.toml IMSG_LISTEN=0.0.0.0:8080
+EXPOSE 8080
+VOLUME ["/state"]
+ENTRYPOINT ["imsg-server"]
+CMD ["serve"]

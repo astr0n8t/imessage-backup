@@ -1,7 +1,12 @@
 name: CI
 on:
   push:
+    branches: ["**"]
   pull_request:
+  # Also run as the first stage of the release workflow.
+  workflow_call:
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
