@@ -26,7 +26,10 @@ const WRAP_PASSCODE: u32 = 2;
 /// A parsed backup keybag with (after [`Keybag::unlock`]) its class keys.
 #[derive(Debug, Default)]
 pub struct Keybag {
-    attrs: HashMap<String, Vec<u8>>,
+    /// Keybag-level attributes, every occurrence in file order. Real keybags
+    /// can repeat attributes (e.g. `SALT`/`ITER`/`DPSL`/`DPIC`); the first
+    /// occurrence is authoritative, as in other implementations (crabapple).
+    attrs: HashMap<String, Vec<Vec<u8>>>,
     class_keys: HashMap<u32, ClassKey>,
 }
 
@@ -41,28 +44,47 @@ fn be_u32(data: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(data.try_into().ok()?))
 }
 
+/// Iterate `(tag, value)` records of a TLV keybag blob.
+fn tlv(data: &[u8]) -> impl Iterator<Item = Result<(String, &[u8])>> + '_ {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if pos + 8 > data.len() {
+            return None;
+        }
+        let tag = String::from_utf8_lossy(&data[pos..pos + 4]).to_string();
+        let len = be_u32(&data[pos + 4..pos + 8]).unwrap() as usize;
+        let start = pos + 8;
+        match start.checked_add(len).filter(|e| *e <= data.len()) {
+            Some(end) => {
+                pos = end;
+                Some(Ok((tag, &data[start..end])))
+            }
+            None => {
+                pos = data.len();
+                Some(Err(anyhow!("truncated keybag record {tag}")))
+            }
+        }
+    })
+}
+
+/// One set of key-derivation inputs: optional `(DPSL, DPIC)` pre-stretch, `SALT`, `ITER`.
+type Derivation<'a> = (Option<(&'a [u8], u32)>, &'a [u8], u32);
+
+/// Upper bound on key derivations tried when attributes are repeated.
+const MAX_DERIVATIONS: usize = 16;
+
 impl Keybag {
     /// Parse the TLV-encoded `BackupKeyBag` blob.
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut bag = Keybag::default();
         let mut current: Option<(Option<u32>, ClassKey)> = None;
         let mut seen_uuid = false;
-        let mut pos = 0;
-        while pos + 8 <= data.len() {
-            let tag = String::from_utf8_lossy(&data[pos..pos + 4]).to_string();
-            let len = be_u32(&data[pos + 4..pos + 8]).unwrap() as usize;
-            let start = pos + 8;
-            let end = start
-                .checked_add(len)
-                .filter(|e| *e <= data.len())
-                .ok_or_else(|| anyhow!("truncated keybag record {tag}"))?;
-            let value = &data[start..end];
-            pos = end;
-
+        for record in tlv(data) {
+            let (tag, value) = record?;
             match tag.as_str() {
                 "UUID" if !seen_uuid => {
                     seen_uuid = true;
-                    bag.attrs.insert(tag, value.to_vec());
+                    bag.attrs.entry(tag).or_default().push(value.to_vec());
                 }
                 "UUID" => {
                     if let Some((Some(class), key)) = current.take() {
@@ -79,9 +101,7 @@ impl Keybag {
                         _ => {}
                     }
                 }
-                _ => {
-                    bag.attrs.insert(tag, value.to_vec());
-                }
+                _ => bag.attrs.entry(tag).or_default().push(value.to_vec()),
             }
         }
         if let Some((Some(class), key)) = current.take() {
@@ -93,53 +113,132 @@ impl Keybag {
         Ok(bag)
     }
 
-    fn attr(&self, name: &str) -> Result<&[u8]> {
-        self.attrs
-            .get(name)
-            .map(Vec::as_slice)
-            .ok_or_else(|| anyhow!("keybag is missing {name}"))
+    /// Distinct values of an attribute, first occurrence first.
+    fn candidates(&self, name: &str) -> Vec<&[u8]> {
+        let mut out: Vec<&[u8]> = Vec::new();
+        for v in self.attrs.get(name).into_iter().flatten() {
+            if !out.contains(&v.as_slice()) {
+                out.push(v);
+            }
+        }
+        out
     }
 
-    fn attr_u32(&self, name: &str) -> Result<u32> {
-        be_u32(self.attr(name)?).ok_or_else(|| anyhow!("keybag attribute {name} is not a u32"))
+    /// The `(DPSL, DPIC, SALT, ITER)` combinations to try, most likely first:
+    /// the first occurrence of each, then (only if attributes repeat) the
+    /// alternatives. `DPSL`/`DPIC` are absent before iOS 10.2.
+    fn derivations(&self) -> Result<Vec<Derivation<'_>>> {
+        let u32s = |name: &str| -> Result<Vec<u32>> {
+            self.candidates(name)
+                .into_iter()
+                .map(|v| be_u32(v).ok_or_else(|| anyhow!("keybag attribute {name} is not a u32")))
+                .collect()
+        };
+        let salts = self.candidates("SALT");
+        let iters = u32s("ITER")?;
+        if salts.is_empty() || iters.is_empty() {
+            bail!("keybag is missing SALT/ITER");
+        }
+        let dpsls = self.candidates("DPSL");
+        let dpics = u32s("DPIC")?;
+        let pre: Vec<Option<(&[u8], u32)>> = if dpsls.is_empty() || dpics.is_empty() {
+            vec![None]
+        } else {
+            dpsls
+                .iter()
+                .flat_map(|s| dpics.iter().map(move |i| Some((*s, *i))))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for p in &pre {
+            for salt in &salts {
+                for iter in &iters {
+                    out.push((*p, *salt, *iter));
+                }
+            }
+        }
+        out.truncate(MAX_DERIVATIONS);
+        Ok(out)
     }
 
     /// Derive the passcode key from the backup password and unwrap every class key.
     pub fn unlock(&mut self, password: &[u8]) -> Result<()> {
-        let mut stage1 = [0u8; 32];
-        // Newer backups (iOS 10.2+) add a PBKDF2-SHA256 pre-stretch.
-        let pre: &[u8] = match (self.attrs.get("DPSL"), self.attrs.get("DPIC")) {
-            (Some(salt), Some(_)) => {
-                pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, self.attr_u32("DPIC")?, &mut stage1);
-                &stage1
+        let attempts = self.derivations()?;
+        let mut last_err = None;
+        for (pre, salt, iter) in attempts {
+            let mut stage1 = [0u8; 32];
+            // iOS 10.2+ adds a PBKDF2-SHA256 pre-stretch.
+            let input: &[u8] = match pre {
+                Some((dpsl, dpic)) => {
+                    pbkdf2::pbkdf2_hmac::<Sha256>(password, dpsl, dpic, &mut stage1);
+                    &stage1
+                }
+                None => password,
+            };
+            let mut passcode_key = [0u8; 32];
+            pbkdf2::pbkdf2_hmac::<Sha1>(input, salt, iter, &mut passcode_key);
+            match self.unwrap_class_keys(&passcode_key) {
+                Ok(keys) => {
+                    for (class, key) in keys {
+                        if let Some(ck) = self.class_keys.get_mut(&class) {
+                            ck.key = Some(key);
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => last_err = Some(e),
             }
-            _ => password,
-        };
-        let mut passcode_key = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha1>(
-            pre,
-            self.attr("SALT")?,
-            self.attr_u32("ITER")?,
-            &mut passcode_key,
-        );
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no key derivation parameters")))
+            .context("incorrect backup password (could not unwrap class key)")
+    }
 
-        let mut unlocked = 0;
-        for key in self.class_keys.values_mut() {
+    /// Unwrap every passcode-protected class key, or fail if any does not.
+    fn unwrap_class_keys(&self, passcode_key: &[u8; 32]) -> Result<Vec<(u32, [u8; 32])>> {
+        let mut out = Vec::new();
+        for (class, key) in &self.class_keys {
             if key.wrap & WRAP_PASSCODE == 0 || key.wrapped.len() != 40 {
                 continue;
             }
-            let k = aes_unwrap(&passcode_key, &key.wrapped)
-                .context("incorrect backup password (could not unwrap class key)")?;
-            key.key = Some(
+            let k = aes_unwrap(passcode_key, &key.wrapped)?;
+            out.push((
+                *class,
                 k.try_into()
                     .map_err(|_| anyhow!("unexpected class key length"))?,
-            );
-            unlocked += 1;
+            ));
         }
-        if unlocked == 0 {
+        if out.is_empty() {
             bail!("no class keys could be unlocked");
         }
-        Ok(())
+        Ok(out)
+    }
+
+    /// A human-readable outline of a keybag blob for troubleshooting. Shows
+    /// tags, lengths and integer values; salts and wrapped keys are not shown.
+    pub fn describe(data: &[u8]) -> Result<Vec<String>> {
+        let mut lines = Vec::new();
+        let mut in_class = false;
+        let mut seen_uuid = false;
+        for record in tlv(data) {
+            let (tag, value) = record?;
+            if tag == "UUID" {
+                if seen_uuid {
+                    in_class = true;
+                    lines.push("-- class key --".into());
+                }
+                seen_uuid = true;
+            }
+            let shown = match (tag.as_str(), value.len()) {
+                ("SALT" | "DPSL" | "WPKY" | "PBKY" | "HMCK" | "UUID", n) => format!("<{n} bytes>"),
+                (_, 4) => format!("{}", be_u32(value).unwrap()),
+                (_, n) => format!("<{n} bytes>"),
+            };
+            lines.push(format!(
+                "{}{tag} = {shown}",
+                if in_class { "  " } else { "" }
+            ));
+        }
+        Ok(lines)
     }
 
     /// Unwrap a per-file (or manifest) key protected by `class`.
@@ -365,6 +464,63 @@ mod tests {
         .unwrap();
         assert_eq!(aes_wrap(&kek, &key), expected);
         assert_eq!(aes_unwrap(&kek, &expected).unwrap(), key);
+    }
+
+    fn rec(out: &mut Vec<u8>, tag: &str, value: &[u8]) {
+        out.extend_from_slice(tag.as_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+
+    /// Repeat the derivation attributes, with different values, after the
+    /// class keys. Last-occurrence-wins parsing derives the wrong key here.
+    #[test]
+    fn repeated_attributes_use_first_occurrence() {
+        let (mut bag, keys) = build_test_keybag(b"hunter2", &[1, 3]);
+        rec(&mut bag, "SALT", &[0x55; 20]);
+        rec(&mut bag, "ITER", &1u32.to_be_bytes());
+        rec(&mut bag, "DPSL", &[0x66; 20]);
+        rec(&mut bag, "DPIC", &1u32.to_be_bytes());
+        let mut kb = Keybag::parse(&bag).unwrap();
+        kb.unlock(b"hunter2").unwrap();
+        let file_key = [9u8; 32];
+        assert_eq!(
+            kb.unwrap_key(3, &aes_wrap(&keys[&3], &file_key)).unwrap(),
+            file_key
+        );
+        assert!(Keybag::parse(&bag).unwrap().unlock(b"wrong").is_err());
+    }
+
+    /// If a later occurrence turns out to be the right one, the fallback finds it.
+    #[test]
+    fn repeated_attributes_fall_back_to_alternatives() {
+        let (good, _) = build_test_keybag(b"pw", &[1]);
+        // Same keybag, but with bogus first SALT/ITER and the real ones later.
+        let mut bag = Vec::new();
+        let mut first = true;
+        for r in tlv(&good) {
+            let (tag, value) = r.unwrap();
+            if first && tag == "SALT" {
+                rec(&mut bag, "SALT", &[0x11; 20]);
+                rec(&mut bag, "ITER", &3u32.to_be_bytes());
+                first = false;
+            }
+            rec(&mut bag, &tag, value);
+        }
+        let mut kb = Keybag::parse(&bag).unwrap();
+        assert_eq!(kb.derivations().unwrap().len(), 4);
+        kb.unlock(b"pw").unwrap();
+        assert!(Keybag::parse(&bag).unwrap().unlock(b"nope").is_err());
+    }
+
+    #[test]
+    fn describe_hides_secrets() {
+        let (bag, _) = build_test_keybag(b"pw", &[1]);
+        let lines = Keybag::describe(&bag).unwrap();
+        assert!(lines.contains(&"SALT = <20 bytes>".to_owned()));
+        assert!(lines.contains(&"ITER = 10".to_owned()));
+        assert!(lines.contains(&"  WPKY = <40 bytes>".to_owned()));
+        assert!(lines.contains(&"-- class key --".to_owned()));
     }
 
     #[test]
