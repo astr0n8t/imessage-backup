@@ -141,6 +141,33 @@ async fn accounts_see_only_their_devices_and_ids() {
 
     let index = Index::open(&tmp.path().join("state/index.sqlite")).unwrap();
     assert_eq!(index.ingest_all(&data).unwrap().snapshots, 3);
+    // Finding other devices' copies must be an index seek, not a scan of the
+    // conversation per message (that made /api/status take minutes).
+    {
+        let conn = index.read().unwrap();
+        let view = imsg_server::view::View::everything();
+        view.install(&conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT m.id FROM messages m WHERE m.conv_id = 1 AND {}",
+                view.dedupe("m")
+            ))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|l| l.contains("messages_copies")),
+            "{plan:#?}"
+        );
+        assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "{plan:#?}");
+        let status = imsg_server::queries::status(&conn, &view, &Default::default()).unwrap();
+        assert_eq!(
+            status.messages, 8,
+            "copies on two of Alice's phones count once"
+        );
+    }
     let ids = imsg_server::queries::identities(&index.read().unwrap()).unwrap();
     let bob_ids = &ids
         .iter()
