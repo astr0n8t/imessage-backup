@@ -1,0 +1,213 @@
+# Builds and publishes a release when a version tag (v1.2.3, v1.2.3-rc.1, ...) is pushed:
+#   * imsg-extract + imsg-server archives for Linux (static musl, x86_64/arm64)
+#     and macOS (Apple silicon, Intel and a universal build), with SHA-256 sums,
+#     attached to a GitHub Release;
+#   * a multi-arch (amd64/arm64) imsg-server image on GitHub Container Registry,
+#     ghcr.io/<owner>/<repo>, tagged with the version (and `latest` for
+#     non-prerelease tags).
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  binaries:
+    name: Build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Static binaries that run on any Linux distribution (and in Docker).
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: aarch64-apple-darwin, os: macos-latest, cross: false }
+          - { target: x86_64-apple-darwin, os: macos-latest, cross: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.cross }}
+        run: |
+          tool=cargo
+          if [ "$USE_CROSS" = "true" ]; then tool=cross; fi
+          "$tool" build --release --locked --target "$TARGET" -p imsg-extract -p imsg-server
+      - name: Smoke test
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "target/$TARGET/release/imsg-extract" --version
+          "target/$TARGET/release/imsg-server" --version
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: .github/scripts/package.sh "$GITHUB_REF_NAME" "$TARGET" "target/$TARGET/release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  macos-universal:
+    name: Build universal macOS archive
+    needs: binaries
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*-apple-darwin
+          path: in
+          merge-multiple: true
+      - name: Combine with lipo
+        run: |
+          set -euo pipefail
+          for arch in aarch64 x86_64; do
+            mkdir -p "x/$arch"
+            tar -xzf "in/imessage-backup-${GITHUB_REF_NAME}-${arch}-apple-darwin.tar.gz" -C "x/$arch" --strip-components 1
+          done
+          mkdir -p universal
+          for bin in imsg-extract imsg-server; do
+            lipo -create -output "universal/$bin" "x/aarch64/$bin" "x/x86_64/$bin"
+            lipo -info "universal/$bin"
+          done
+          universal/imsg-server --version
+          .github/scripts/package.sh "${GITHUB_REF_NAME}" universal-apple-darwin universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-universal-apple-darwin
+          path: dist/
+          if-no-files-found: error
+
+  docker:
+    name: Docker image
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*-unknown-linux-musl
+          path: in
+          merge-multiple: true
+      - name: Prepare build context
+        run: |
+          set -euo pipefail
+          mkdir -p context
+          for pair in amd64:x86_64 arm64:aarch64; do
+            arch="${pair%%:*}" target="${pair##*:}-unknown-linux-musl"
+            mkdir -p "context/bin/$arch"
+            tar -xzf "in/imessage-backup-${GITHUB_REF_NAME}-${target}.tar.gz" -C "context/bin/$arch" \
+              --strip-components 1 "imessage-backup-${GITHUB_REF_NAME}-${target}/imsg-server"
+          done
+          ls -lR context
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `latest` is added automatically for non-prerelease versions.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=imsg-server
+            org.opencontainers.image.description=Authenticated web viewer for archived iMessage/SMS backups
+      - uses: docker/build-push-action@v6
+        with:
+          context: context
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Publish GitHub Release
+    needs: [binaries, macos-universal, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          set -euo pipefail
+          (cd dist && cat ./*.sha256 > SHA256SUMS && cat SHA256SUMS)
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::warning::Tag ${GITHUB_REF_NAME} does not match the Cargo version ${version}; binaries report ${version} with --version."
+          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME#v}"
+          cat > notes.md <<NOTES
+          ## Downloads
+
+          | Platform | Archive |
+          |---|---|
+          | macOS (Apple silicon + Intel) | \`imessage-backup-${GITHUB_REF_NAME}-universal-apple-darwin.tar.gz\` |
+          | macOS, Apple silicon only | \`imessage-backup-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz\` |
+          | macOS, Intel only | \`imessage-backup-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz\` |
+          | Linux x86_64 (static) | \`imessage-backup-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz\` |
+          | Linux arm64 (static) | \`imessage-backup-${GITHUB_REF_NAME}-aarch64-unknown-linux-musl.tar.gz\` |
+
+          Each archive contains \`imsg-extract\`, \`imsg-server\` and the README. Verify downloads with \`SHA256SUMS\`.
+          On macOS, the binaries are not notarized. If Gatekeeper blocks them, run
+          \`xattr -d com.apple.quarantine imsg-extract imsg-server\`.
+
+          ## Docker
+
+          \`\`\`sh
+          docker pull ${image}
+          \`\`\`
+          NOTES
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

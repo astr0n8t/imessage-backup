@@ -23,9 +23,16 @@ There are two binaries:
 | `imsg-extract` | the Mac that makes the Finder backups | Pulls `sms.db`, `AddressBook.sqlitedb` and message attachments out of a backup (decrypting encrypted backups). Each run writes a **snapshot** with only the messages added or edited since the previous run. |
 | `imsg-server` | anywhere (Mac, Linux box, NAS, Docker) | Watches the archive folder, parses snapshots with [`imessage-database`](https://crates.io/crates/imessage-database) (the library behind [imessage-exporter](https://github.com/ReagentX/imessage-exporter)), merges them, and serves a web UI with full-text search. |
 
-## Build
+## Install
 
-Requires Rust 1.88 or newer.
+**Prebuilt binaries:** every [release](../../releases) has archives with `imsg-extract` and `imsg-server` for
+macOS (universal, Apple silicon, Intel) and Linux (static x86_64 and arm64 builds that run on any distribution),
+plus a `SHA256SUMS` file. The macOS binaries aren't notarized. If Gatekeeper blocks them, run
+`xattr -d com.apple.quarantine imsg-extract imsg-server`.
+
+**Docker image** (server only, amd64 and arm64): `ghcr.io/astr0n8t/imessage-backup`. See [Docker](#docker).
+
+**From source** (Rust 1.88 or newer):
 
 ```sh
 cargo build --release
@@ -198,11 +205,14 @@ imsg-server serve --data ~/MessagesArchive --accounts accounts.toml --listen 127
 ### Docker
 
 ```sh
-docker build -t imsg-server .
-docker run -d -p 8080:8080 \
+docker run -d --name imsg -p 8080:8080 \
   -v /srv/imsg/archive:/data:ro -v /srv/imsg/state:/state -v /srv/imsg/accounts.toml:/accounts.toml:ro \
-  imsg-server
+  ghcr.io/astr0n8t/imessage-backup:latest
 ```
+
+Images are tagged with each release's version (`1.2.3`, `1.2`) and `latest`. To build the image yourself from
+source instead, run `docker build -t imsg-server .`. The image runs as an unprivileged user. Keep the state volume
+(index, sessions, transcode cache) on persistent storage.
 
 The image includes `heif-convert` and `ffmpeg`, so HEIC photos and CAF/AMR voice messages are converted to
 JPEG and M4A for browsers that can't play them natively. Outside Docker, install `libheif-examples` (or
@@ -281,6 +291,25 @@ cargo run -p imsg-extract -- extract --backup /tmp/demo-backup/00008110-SAMPLE -
 
 Crates: `imsg-core` (backup reading and decryption, archive layout, state file, contacts),
 `imsg-extract` (CLI), `imsg-server` (indexer and web app).
+
+### Making a release
+
+1. Bump `version` in the workspace `Cargo.toml` (binaries report it with `--version`), and commit.
+2. Tag and push: `git tag v1.2.3 && git push origin v1.2.3`. Tags with a suffix such as `v1.2.3-rc.1` become
+   pre-releases and don't move the `latest` image tag.
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) then:
+
+* runs the test suite on Linux and macOS;
+* builds static Linux binaries (x86_64, arm64) with `cross`, and macOS binaries (Apple silicon, Intel, plus a
+  universal `lipo` build), then smoke-tests and packages them with checksums;
+* builds a multi-arch image from those binaries (no compilation under emulation) and pushes it to GitHub
+  Container Registry;
+* publishes a GitHub Release with the archives, `SHA256SUMS` and generated notes.
+
+The first time the image is pushed, GitHub creates the `imessage-backup` package. If the repository is private, the
+package is private too. Change its visibility under the package's settings if you want to pull it without logging
+in.
 
 ### Limitations
 
