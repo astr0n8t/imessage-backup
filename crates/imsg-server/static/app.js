@@ -425,33 +425,45 @@ window.addEventListener("popstate", () => {
 $("#lightbox").addEventListener("cancel", (ev) => { ev.preventDefault(); history.back(); });
 
 // ---- Status --------------------------------------------------------------
+// Opens immediately and fills in when the server answers, so a slow archive
+// (or an error) never makes the button look dead.
 async function showStatus() {
-  const s = await api("/api/status");
+  const d = $("#status-dialog");
   const body = $("#status-body");
-  const rows = s.snapshots.map((x) => el("tr", {},
-    el("td", { text: x.device_name ? `${x.device_name} (${x.device})` : x.device }), el("td", { text: x.snapshot_id }),
-    el("td", { text: x.backup_ms ? fullFmt.format(x.backup_ms) : "" }), el("td", { text: x.messages.toLocaleString() })));
   const who = state.me ? `Signed in as ${state.me.name}${state.viewAs ? ` · viewing ${state.viewAs}` : ""} · ` +
     `two-factor ${state.me.totp ? "on" : "off"}` : "";
-  let identities = null;
-  if (state.me && state.me.admin) {
-    const ids = await api("/api/identities");
-    identities = [el("h3", { text: "Devices & iMessage IDs (for the accounts file)" }),
-      el("div", { class: "table-scroll" }, el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device UDID" }), el("th", { text: "Name" }), el("th", { text: "iMessage IDs used" }))),
-        el("tbody", {}, ids.map((d) => el("tr", {},
-          el("td", {}, el("code", { text: d.device })), el("td", { text: d.device_name || "" }),
-          el("td", { text: d.imessage_ids.map(([id, n]) => `${id || "(unknown)"} (${n})`).join(", ") }))))))];
-  }
-  body.replaceChildren(
-    el("p", { text: who }),
-    el("p", { text: `${s.messages.toLocaleString()} messages in ${s.conversations.toLocaleString()} conversations · ${s.contacts.toLocaleString()} contact handles` }),
-    el("p", { text: `Transcoding: ${s.transcoding}` }),
-    s.last_scan ? el("p", { text: `Last scan ${fullFmt.format(new Date(s.last_scan.at))}: ${s.last_scan.report.snapshots} new snapshot(s), ${s.last_scan.report.waiting} waiting for files, ${s.last_scan.report.failed} failed` }) : null,
-    el("h3", { text: "Snapshots" }),
-    el("div", { class: "table-scroll" }, el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device" }), el("th", { text: "Snapshot" }), el("th", { text: "Backup" }), el("th", { text: "Messages" }))), el("tbody", {}, rows))),
-    ...(identities || []));
-  const d = $("#status-dialog");
+  body.replaceChildren(el("p", { text: who }), el("p", { class: "loader", text: "Loading archive status…" }));
   if (!d.open) d.showModal();
+
+  const [status, ids] = await Promise.allSettled([
+    api("/api/status"),
+    state.me && state.me.admin ? api("/api/identities") : Promise.resolve(null),
+  ]);
+  const parts = [el("p", { text: who })];
+  if (status.status === "fulfilled") {
+    const s = status.value;
+    const rows = s.snapshots.map((x) => el("tr", {},
+      el("td", { text: x.device_name ? `${x.device_name} (${x.device})` : x.device }), el("td", { text: x.snapshot_id }),
+      el("td", { text: x.backup_ms ? fullFmt.format(x.backup_ms) : "" }), el("td", { text: (x.messages ?? 0).toLocaleString() })));
+    parts.push(
+      el("p", { text: `${s.messages.toLocaleString()} messages in ${s.conversations.toLocaleString()} conversations · ${s.contacts.toLocaleString()} contact handles` }),
+      el("p", { text: `Transcoding: ${s.transcoding}` }),
+      s.last_scan ? el("p", { text: `Last scan ${fullFmt.format(new Date(s.last_scan.at))}: ${s.last_scan.report.snapshots} new snapshot(s), ${s.last_scan.report.waiting} waiting for files, ${s.last_scan.report.failed} failed` }) : null,
+      el("h3", { text: "Snapshots" }),
+      el("div", { class: "table-scroll" }, el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device" }), el("th", { text: "Snapshot" }), el("th", { text: "Backup" }), el("th", { text: "Messages" }))), el("tbody", {}, rows))));
+  } else {
+    parts.push(el("p", { class: "login-error", text: `Couldn't load archive status: ${status.reason.message || status.reason}` }));
+  }
+  if (ids.status === "fulfilled" && ids.value) {
+    parts.push(el("h3", { text: "Devices & iMessage IDs (for the accounts file)" }),
+      el("div", { class: "table-scroll" }, el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Device UDID" }), el("th", { text: "Name" }), el("th", { text: "iMessage IDs used" }))),
+        el("tbody", {}, ids.value.map((x) => el("tr", {},
+          el("td", {}, el("code", { text: x.device })), el("td", { text: x.device_name || "" }),
+          el("td", { text: x.imessage_ids.map(([id, n]) => `${id || "(unknown)"} (${n})`).join(", ") })))))));
+  } else if (ids.status === "rejected") {
+    parts.push(el("p", { class: "login-error", text: `Couldn't load devices: ${ids.reason.message || ids.reason}` }));
+  }
+  body.replaceChildren(...parts);
 }
 
 // ---- Routing / wiring ----------------------------------------------------

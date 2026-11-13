@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS messages (
     assoc_guid TEXT, assoc_part INTEGER, reaction TEXT, reaction_removed INTEGER NOT NULL DEFAULT 0,
     thread_guid TEXT, expressive TEXT, snap_order INTEGER NOT NULL, UNIQUE (device, guid));
 CREATE INDEX IF NOT EXISTS messages_guid ON messages (guid);
+-- Finds the other devices' copies of a message (see View::dedupe).
+CREATE INDEX IF NOT EXISTS messages_copies ON messages (guid, conv_id, is_from_me, snap_order DESC, id DESC);
 CREATE INDEX IF NOT EXISTS messages_conv_date ON messages (conv_id, date_ms, id);
 CREATE INDEX IF NOT EXISTS messages_assoc ON messages (assoc_guid);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (thread_guid);
@@ -115,6 +117,19 @@ impl Index {
             "INSERT OR REPLACE INTO meta VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION],
         )?;
+        // Indexes built before planner statistics were collected: collect them
+        // once (bounded work) so queries use the right indexes.
+        let has_stats: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has_stats {
+            conn.execute_batch("PRAGMA analysis_limit = 1000; ANALYZE;")?;
+        }
         Ok(Self {
             path: path.to_path_buf(),
         })
@@ -133,6 +148,14 @@ impl Index {
         )?;
         c.busy_timeout(std::time::Duration::from_secs(10))?;
         Ok(c)
+    }
+
+    /// Where temporary copies of snapshot databases go (next to the index).
+    fn scratch_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
     }
 
     /// Ingest every complete, not-yet-ingested snapshot below `data`.
@@ -157,7 +180,7 @@ impl Index {
                 report.waiting += 1;
                 continue;
             }
-            match ingest_snapshot(&mut conn, snap) {
+            match ingest_snapshot(&mut conn, snap, &self.scratch_dir()) {
                 Ok(n) => {
                     info!(snapshot = %snap.meta.snapshot_id, device = %snap.meta.device_udid, messages = n, "ingested");
                     report.snapshots += 1;
@@ -187,7 +210,27 @@ fn snap_order(snap: &SnapshotRef) -> i64 {
         .timestamp_millis()
 }
 
-fn ingest_snapshot(conn: &mut Connection, snap: &SnapshotRef) -> Result<usize> {
+/// The `sms.db` to parse: the snapshot's own file, or, when it lacks the
+/// reply index (older snapshots), an indexed temporary copy. The archive may
+/// be read-only, so the original is never modified.
+fn readable_sms_db(sms: &Path, scratch: &Path) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    let ro = Connection::open_with_flags(sms, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_col = imsg_core::sqlite::has_column(&ro, "message", "thread_originator_guid")?;
+    if !has_col || imsg_core::sqlite::has_index_on(&ro, "message", "thread_originator_guid")? {
+        return Ok((sms.to_path_buf(), None));
+    }
+    drop(ro);
+    let dir = tempfile::Builder::new()
+        .prefix(".ingest-")
+        .tempdir_in(scratch)?;
+    let copy = dir.path().join(SMS_DB_FILE);
+    std::fs::copy(sms, &copy)?;
+    let rw = Connection::open(&copy)?;
+    imsg_core::sqlite::ensure_reply_index(&rw)?;
+    Ok((copy, Some(dir)))
+}
+
+fn ingest_snapshot(conn: &mut Connection, snap: &SnapshotRef, scratch: &Path) -> Result<usize> {
     let tx = conn.transaction()?;
     let device = &snap.meta.device_udid;
     let order = snap_order(snap);
@@ -195,6 +238,7 @@ fn ingest_snapshot(conn: &mut Connection, snap: &SnapshotRef) -> Result<usize> {
 
     let sms = snap.dir.join(SMS_DB_FILE);
     if snap.meta.has_file(SMS_DB_FILE) {
+        let (sms, _tmp) = readable_sms_db(&sms, scratch)?;
         let db: idb_sqlite::Connection = get_connection(&sms)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("opening sms.db")?;
@@ -396,7 +440,51 @@ fn refresh_stats(conn: &Connection) -> Result<()> {
          INSERT INTO conv_stats
             SELECT conv_id, device, owner, sum(kind = 'message'), max(date_ms)
             FROM messages WHERE kind IN ('message', 'announcement') GROUP BY conv_id, device, owner;
-         COMMIT;",
+         COMMIT;
+         -- Refresh planner statistics so SQLite picks good indexes.
+         PRAGMA analysis_limit = 1000;
+         ANALYZE;",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Snapshots written before the extractor added the reply index are
+    /// parsed from an indexed temporary copy; the archive is left untouched.
+    #[test]
+    fn unindexed_snapshot_uses_indexed_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sms = tmp.path().join("sms.db");
+        imsg_core::fixture::SmsFixture::create(&sms).unwrap();
+        let before = std::fs::read(&sms).unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (path, guard) = readable_sms_db(&sms, &scratch).unwrap();
+        assert_ne!(path, sms);
+        let copy = Connection::open(&path).unwrap();
+        assert!(
+            imsg_core::sqlite::has_index_on(&copy, "message", "thread_originator_guid").unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&sms).unwrap(),
+            before,
+            "original not modified"
+        );
+        drop(copy);
+        drop(guard);
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "temporary copy removed"
+        );
+
+        // Already indexed (as the extractor now writes them): used directly.
+        imsg_core::sqlite::ensure_reply_index(&Connection::open(&sms).unwrap()).unwrap();
+        let (path, guard) = readable_sms_db(&sms, &scratch).unwrap();
+        assert_eq!(path, sms);
+        assert!(guard.is_none());
+    }
 }

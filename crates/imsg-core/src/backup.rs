@@ -120,6 +120,16 @@ impl BackupInfo {
     }
 }
 
+/// The raw `BackupKeyBag` of an encrypted backup (for diagnostics).
+pub fn read_keybag(root: &Path) -> Result<Vec<u8>> {
+    let manifest = read_dict(&root.join("Manifest.plist"))?;
+    manifest
+        .get("BackupKeyBag")
+        .and_then(Value::as_data)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow!("Manifest.plist has no BackupKeyBag (is the backup encrypted?)"))
+}
+
 /// Enumerate backups below a backup root, newest first.
 pub fn list_backups(root: &Path) -> Result<Vec<(PathBuf, BackupInfo)>> {
     let mut out = Vec::new();
@@ -260,7 +270,13 @@ impl Backup {
             .and_then(Value::as_data)
             .ok_or_else(|| anyhow!("Manifest.plist has no ManifestKey"))?;
         let mut keybag = Keybag::parse(keybag_data)?;
-        keybag.unlock(password.as_bytes())?;
+        keybag.unlock(password.as_bytes()).with_context(|| {
+            format!(
+                "could not unlock the backup's keys. If you are sure the password is right, \
+                 please report the (secret-free) output of `imsg-extract keybag --backup {}`",
+                root.display()
+            )
+        })?;
         if manifest_key.len() < 4 + 24 {
             bail!("ManifestKey too short");
         }

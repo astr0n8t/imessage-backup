@@ -55,7 +55,10 @@ imsg-extract extract --out ~/MessagesArchive
 ```
 
 By default `extract` uses the most recent backup. Use `--udid <UDID>` or `--backup <path>` to pick one.
-For an encrypted backup, set `IMSG_BACKUP_PASSWORD` or enter the password when prompted.
+For an encrypted backup, set `IMSG_BACKUP_PASSWORD` or enter the password when prompted. (When setting the
+variable in a shell, use single quotes so characters like `$` or `!` in the password aren't expanded.) If a password
+you know is correct is rejected, run `imsg-extract keybag` and include its output in a bug report. It prints the
+structure of the backup's key bag without any password, salts or keys.
 
 Each run:
 

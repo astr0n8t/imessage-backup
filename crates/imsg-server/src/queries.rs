@@ -207,8 +207,8 @@ fn conversation_out(
     let msg_count = if exact {
         conn.query_row(
             &format!(
-                "SELECT count(*) FROM messages m WHERE m.conv_id = ?1 AND m.kind = 'message' AND {vis} AND {}",
-                view.dedupe("m")
+                "SELECT {} FROM messages m WHERE m.conv_id = ?1 AND m.kind = 'message' AND {vis}",
+                view.distinct_count("m")
             ),
             [id],
             |r| r.get(0),
@@ -704,9 +704,9 @@ pub fn status(conn: &Connection, view: &View, names: &Names) -> Result<Status> {
             view.filter("a")
         ))?,
         messages: count(format!(
-            "SELECT count(*) FROM messages m WHERE m.kind = 'message' AND {} AND {}",
-            view.filter("m"),
-            view.dedupe("m")
+            "SELECT {} FROM messages m WHERE m.kind = 'message' AND {}",
+            view.distinct_count("m"),
+            view.filter("m")
         ))?,
         contacts: names.0.len() as i64,
     })

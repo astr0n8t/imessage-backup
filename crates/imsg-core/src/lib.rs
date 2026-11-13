@@ -5,4 +5,5 @@ pub mod backup;
 pub mod contacts;
 pub mod crypto;
 pub mod fixture;
+pub mod sqlite;
 pub mod state;

@@ -22,6 +22,20 @@ enum Command {
         #[arg(long)]
         backup_root: Option<PathBuf>,
     },
+    /// Print the structure of an encrypted backup's keybag, for troubleshooting
+    /// password errors. Shows tag names, lengths and counts only: no password,
+    /// salts or keys, so the output is safe to share.
+    Keybag {
+        /// A specific backup folder (…/MobileSync/Backup/<UDID>).
+        #[arg(short, long, conflicts_with = "udid")]
+        backup: Option<PathBuf>,
+        /// Pick the backup of this device from --backup-root.
+        #[arg(long)]
+        udid: Option<String>,
+        /// Folder holding backups (default: ~/Library/Application Support/MobileSync/Backup).
+        #[arg(long)]
+        backup_root: Option<PathBuf>,
+    },
     /// Extract new messages, attachments and contacts into the archive.
     Extract {
         /// Archive (or staging) folder to write into.
@@ -72,6 +86,29 @@ fn describe(info: &BackupInfo) -> String {
     )
 }
 
+/// `--backup`, or the backup of `--udid` (default: the newest) under the backup root.
+fn choose_backup(
+    backup: Option<PathBuf>,
+    udid: Option<&str>,
+    backup_root: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(b) = backup {
+        return Ok(b);
+    }
+    let root = backup_root.unwrap_or_else(default_backup_root);
+    let all = list_backups(&root)?;
+    let chosen = match udid {
+        Some(u) => all
+            .into_iter()
+            .find(|(_, i)| i.udid.eq_ignore_ascii_case(u)),
+        None => all.into_iter().next(),
+    };
+    match chosen {
+        Some((path, _)) => Ok(path),
+        None => bail!("no matching backup found in {}", root.display()),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -83,6 +120,24 @@ fn main() -> Result<()> {
             }
             for (path, info) in backups {
                 println!("{}\n    {}", describe(&info), path.display());
+            }
+        }
+        Command::Keybag {
+            backup,
+            udid,
+            backup_root,
+        } => {
+            let backup = choose_backup(backup, udid.as_deref(), backup_root)?;
+            let info = BackupInfo::read(&backup)?;
+            println!("{}", describe(&info));
+            if !info.encrypted {
+                println!("This backup is not encrypted; no password is needed.");
+                return Ok(());
+            }
+            let blob = imsg_core::backup::read_keybag(&backup)?;
+            println!("BackupKeyBag: {} bytes", blob.len());
+            for line in imsg_core::crypto::Keybag::describe(&blob)? {
+                println!("  {line}");
             }
         }
         Command::Extract {
@@ -97,23 +152,7 @@ fn main() -> Result<()> {
             password_env,
             json,
         } => {
-            let backup = match backup {
-                Some(b) => b,
-                None => {
-                    let root = backup_root.unwrap_or_else(default_backup_root);
-                    let all = list_backups(&root)?;
-                    let chosen = match &udid {
-                        Some(u) => all
-                            .into_iter()
-                            .find(|(_, i)| i.udid.eq_ignore_ascii_case(u)),
-                        None => all.into_iter().next(),
-                    };
-                    match chosen {
-                        Some((path, _)) => path,
-                        None => bail!("no matching backup found in {}", root.display()),
-                    }
-                }
-            };
+            let backup = choose_backup(backup, udid.as_deref(), backup_root)?;
             let info = BackupInfo::read(&backup)?;
             let password = if info.encrypted {
                 match std::env::var(&password_env) {

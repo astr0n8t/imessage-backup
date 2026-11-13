@@ -80,10 +80,27 @@ impl View {
         if !self.all && self.owners.is_empty() && self.devices.len() <= 1 {
             return "1".into();
         }
+        // `INDEXED BY` pins the lookup to the (guid, conv_id, is_from_me,
+        // snap_order, id) index: one seek per row, already in the wanted order.
+        // Left to itself SQLite may pick the conversation index instead and
+        // scan the whole conversation for every message (quadratic).
         format!(
-            "{alias}.id = (SELECT d2.id FROM messages d2 WHERE d2.guid = {alias}.guid AND d2.conv_id = {alias}.conv_id
+            "{alias}.id = (SELECT d2.id FROM messages d2 INDEXED BY messages_copies
+               WHERE d2.guid = {alias}.guid AND d2.conv_id = {alias}.conv_id
                AND d2.is_from_me = {alias}.is_from_me AND {} ORDER BY d2.snap_order DESC, d2.id DESC LIMIT 1)",
             self.filter("d2")
+        )
+    }
+
+    /// SQL expression counting distinct messages among rows of `alias`
+    /// (copies held by several devices count once). Much cheaper than
+    /// filtering with [`View::dedupe`] when only a count is needed.
+    pub fn distinct_count(&self, alias: &str) -> String {
+        if !self.all && self.owners.is_empty() && self.devices.len() <= 1 {
+            return "count(*)".into();
+        }
+        format!(
+            "count(DISTINCT {alias}.guid || '/' || {alias}.conv_id || '/' || {alias}.is_from_me)"
         )
     }
 }

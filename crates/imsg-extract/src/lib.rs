@@ -291,6 +291,7 @@ pub fn run(opts: &Options, log: &mut dyn FnMut(String)) -> Result<Report> {
                 file_ids.insert(id);
             }
         }
+        imsg_core::sqlite::ensure_reply_index(&db)?;
         vacuum_into(&db, &staging.join(SMS_DB_FILE))?;
     }
     drop(db);

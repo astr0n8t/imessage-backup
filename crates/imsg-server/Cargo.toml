@@ -21,6 +21,7 @@ chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "fs", "process", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -38,7 +39,6 @@ hmac = "0.12"
 sha1 = "0.10"
 
 [dev-dependencies]
-tempfile.workspace = true
 imsg-extract = { path = "../imsg-extract" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
