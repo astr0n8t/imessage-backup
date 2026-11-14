@@ -1,5 +1,7 @@
 # imessage-backup
 
+Note: vibecoded
+
 Archive your iPhone's texts and iMessages from local Finder backups, incrementally, and browse every message
 from every backup in a password-protected web app.
 
